@@ -24,8 +24,7 @@
 import time
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-# from functorch import vmap
-from functorch import vmap, jacrev
+from functorch import vmap
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -51,6 +50,7 @@ from .utils.gae import compute_gae
 LR_SCHEDULER = lr_scheduler._LRScheduler
 from torchrl.modules import TanhNormal, IndependentNormal
 
+from tensordict import TensorDict, TensorDictBase
 
 class MAPPOPolicy(object):
     def __init__(
@@ -253,49 +253,46 @@ class MAPPOPolicy(object):
         )
         actor_input.batch_size = [*actor_input.batch_size, self.agent_spec.n]
 
-        j_coef = self.cfg.actor.get("jacobian_coef", 0)
-        jacobian_loss = torch.tensor(0.0, device=self.device)
+# --- [新增] FlipNet 雅克比正则化逻辑 ---
+        # 1. 提取观测并开启梯度记录
+        obs = actor_input[self.obs_name].clone().requires_grad_(True)
+        # 2. 关键：把开启梯度的 obs 放回字典，这样 Actor 才会使用这个开启了梯度的张量
+        actor_input[self.obs_name] = obs
 
-        # ==========================================================
-        # --- [核心修改]：正确且隔离的函数式 Jacobian 计算 ---
-        # ==========================================================
-        
-        # 1. 定义针对“单无人机、单状态”的纯函数
-        def get_mu_single(single_obs, single_params):
-            # 将 Tensor 包装回 TensorDict 以适配 Actor 接口
-            # 注意：这里的 single_obs 维度是 [obs_dim]
-            td = TensorDict({self.obs_name: single_obs}, batch_size=[], device=single_obs.device)
-            # 必须使用传入的 single_params 才能保证梯度传导
-            res_td = self.actor(td, single_params, deterministic=True)
-            return res_td[self.act_name] # 返回 [act_dim]
-
-        # 2. 准备数据：彻底隔离输入，防止 requires_grad 泄露
-        obs = actor_input[self.obs_name].detach() # 确保 obs 是干净的
-        params = self.actor_params
-
-        # 3. 构造 Jacobian 算子并处理 Batch + Agent 维度
-        # jacrev(get_mu_single) 计算的是 [act_dim, obs_dim] 的导数矩阵
-        jac_func = jacrev(get_mu_single, argnums=0)
-
-        # 使用嵌套 vmap：外层映射 Batch (dim 0)，内层映射 Agent (dim 1)
+        # 2. 获取确定性输出 (Mode/Mean) 用于计算雅克比
+        # 我们需要知道在当前状态下，"最优动作" 是如何随 "状态" 变化的
+# 2. 获取输出 TensorDict (而不是元组)
         if self.cfg.share_actor:
-            # 共享参数：params 对所有 Batch/Agent 都是 None (即不随维度变化)
-            # in_dims: (obs 的映射维, params 的映射维)
-            inner_vmap = vmap(jac_func, in_dims=(0, None)) # 映射 Agent 维
-            jac_op = vmap(inner_vmap, in_dims=(0, None))   # 映射 Batch 维
-            jac = jac_op(obs, params)
+            # 修改点：不再解构，而是接收返回的 TensorDict
+            actor_output = self.actor(actor_input, self.actor_params, deterministic=True)
         else:
-            # 非共享参数：params 随 Agent (dim 1) 变化
-            inner_vmap = vmap(jac_func, in_dims=(0, 0))    # 映射 Agent 维
-            jac_op = vmap(inner_vmap, in_dims=(0, None))   # 映射 Batch 维
-            jac = jac_op(obs, params)
-
-        # 4. 计算 Jacobian 范数
-        # jac 维度为 [Batch, Agent, Act_Dim, Obs_Dim]
-        # pow(2).sum() 计算 Frobenius 范数的平方
-        jacobian_loss = jac.pow(2).sum(dim=(-1, -2)).mean()
-        jacobian_loss_mapped = torch.tanh(jacobian_loss / 5.0) * 5.0
+            actor_output = vmap(self.actor, in_dims=(1, 0), out_dims=1)(
+                actor_input, self.actor_params, deterministic=True
+            )
+# 3. 从 TensorDict 中提取 mu (即动作)
+        # self.act_name 对应的是 ("agents", "action")
+        mu = actor_output[self.act_name]
+        # 3. 计算 Jacobian: d(mu) / d(obs)
+        # 我们使用 Frobenius 范数的近似：对输出求和后对输入求偏导
+        # 注意：create_graph=True 是必须的，因为我们要对导数再求导更新权重
+        ones = torch.ones_like(mu)
+        grad_phi = torch.autograd.grad(
+            outputs=mu,
+            inputs=obs,
+            grad_outputs=ones,
+            create_graph=True, 
+            retain_graph=True,
+            only_inputs=True
+        )[0]
         
+        # 计算雅克比损失：即偏导数的平方和
+        # 这一项越小，策略越平滑 (Lipschitz 常数越小)
+        jacobian_loss = grad_phi.pow(2).sum(dim=-1).mean()
+        # 雅克比系数 lambda，建议初始设为 0.01
+        jacobian_coef = self.cfg.get("jacobian_coef", 0.01)
+
+
+
         log_probs_old = batch[self.act_logps_name]
         if hasattr(self, "minibatch_seq_len"): # [N, T, A, *]
             actor_output = vmap(self.actor, in_dims=(2, 0), out_dims=2)(
@@ -310,6 +307,7 @@ class MAPPOPolicy(object):
                 )
 
         log_probs_new = actor_output[self.act_logps_name]
+        # 熵损失逻辑保留
         if not self.cfg.actor.tanh:
             dist_entropy = actor_output[f"{self.agent_spec.name}.action_entropy"]
             assert advantages.shape == log_probs_new.shape == dist_entropy.shape
@@ -327,32 +325,25 @@ class MAPPOPolicy(object):
             entropy_loss = - torch.mean(-log_probs_new)
 
         self.actor_opt.zero_grad()
-        # # 这里把三项 Loss 合并在一起，j_coef 为 0 时它就退化回原版逻辑
-        # total_loss = policy_loss + entropy_loss * self.cfg.entropy_coef + jacobian_loss * j_coef
-        # total_loss.backward()
-
-        # 20260107第二次修改
-        # 最终合并 Loss
-        # 即使 j_coef 为 0，这里的计算也是安全的，因为 jac 是独立生成的
-        (policy_loss + entropy_loss * self.cfg.entropy_coef + jacobian_loss_mapped * j_coef).backward()
-            #原版
         # (policy_loss + entropy_loss * self.cfg.entropy_coef).backward()
+        
+        # --- [修改] 汇总 Loss 并反向传播 ---
+        # 将 Jacobian Loss 合并进入总 Loss
+        total_actor_loss = policy_loss + entropy_loss * self.cfg.entropy_coef + jacobian_loss * jacobian_coef
+        total_actor_loss.backward()
+        
         grad_norm = torch.nn.utils.clip_grad_norm_(
             self.actor_opt.param_groups[0]["params"], self.cfg.max_grad_norm
         )
         self.actor_opt.step()
 
         ess = (2 * ratio.logsumexp(0) - (2 * ratio).logsumexp(0)).exp().mean() / ratio.shape[0]
-        weighted_jacobian = jacobian_loss.item() * j_coef
         return {
             "policy_loss": policy_loss.item(),
             "actor_grad_norm": grad_norm.item(),
             "entropy": - entropy_loss.item(),
             "ESS": ess.item(),
-            # 记录原始jacobian损失，观察网络的平滑程度
-            "jacobian_loss_raw": jacobian_loss.item(),
-            # 记录加权损失，直接与 policy_loss 对比权重
-            "jacobian_loss_weighted": weighted_jacobian
+            "jacobian_loss": jacobian_loss.item()  # <--- 新增这一行
         }
 
     def update_critic(self, batch: TensorDict) -> Dict[str, Any]:
@@ -509,7 +500,62 @@ from .modules.distributions import (
 from .modules.rnn import GRU
 from .common import make_encoder
 
+import torch.nn as nn
+from torch.nn.utils import spectral_norm
+
+# # 定义受限线性层，不再需要傅里叶层
+# class LipschitzLinear(nn.Module):
+#     def __init__(self, in_dim, out_dim):
+#         super().__init__()
+#         # 核心：通过谱归一化强制满足 Lipschitz 约束
+#         self.net = spectral_norm(nn.Linear(in_dim, out_dim))
+
+#     def forward(self, x):
+#         return self.net(x)
+
+# def make_ppo_actor(cfg, observation_spec: TensorSpec, action_spec: TensorSpec):
+#     # 自动获取维度
+#     obs_dim = observation_spec.shape[-1]
+#     action_dim = action_spec.shape[-1]
+    
+#     # 结构：直接使用传统的 MLP 结构，但每一层都是 LipschitzLinear
+#     # 这里的 256, 128 等参数可以根据 cfg.actor.hidden_units 动态获取
+#     encoder = nn.Sequential(
+#         LipschitzLinear(obs_dim, 256),
+#         nn.Tanh(),  # 使用 Tanh 保持平滑
+#         LipschitzLinear(256, 256),
+#         nn.Tanh(),
+#         LipschitzLinear(256, 64),
+#         nn.Tanh()
+#     )
+#     # 必须手动添加 output_shape 属性，否则原有 Actor 类运行会报错
+#     encoder.output_shape = torch.Size((64,))
+
+#     # 动作分布层（保持不变）
+#     if isinstance(action_spec, (UnboundedTensorSpec, BoundedTensorSpec)):
+#         act_dist = DiagGaussian(64, action_dim, False, 0.01)
+#     else:
+#         raise NotImplementedError(action_spec)
+
+#     return Actor(encoder, act_dist, None)
+
+
 def make_ppo_actor(cfg, observation_spec: TensorSpec, action_spec: TensorSpec):
+
+    # --- 修改点 1：处理字典格式的 Spec ---
+    # 如果 observation_spec 是 CompositeSpec (字典)，手动提取核心观测维度
+    if isinstance(observation_spec, (CompositeSpec, dict)):
+        # 在 SimpleFlight 中，核心观测通常在 ("agents", "observation") 路径下
+        inner_spec = observation_spec[("agents", "observation")]
+        obs_dim = inner_spec.shape[-1]
+    else:
+        obs_dim = observation_spec.shape[-1]
+
+    action_dim = action_spec.shape[-1]
+    
+    # 按照配置使用工厂函数创建 encoder (MLP)
+    # 此时 obs_dim 是一个确定的整数，nn.Linear 不会再报错
+
     encoder = make_encoder(cfg, observation_spec)
 
     if isinstance(action_spec, MultiDiscreteTensorSpec):
@@ -579,6 +625,17 @@ class Actor(nn.Module):
         deterministic=False,
         eval_action=False
     ):
+
+# --- 修改点 2：在计算前将字典转换为向量 ---
+
+ # --- 修改点：适配 TensorDict 提取 ---
+        if isinstance(obs, (TensorDict, TensorDictBase)):
+            # 只有当 obs 是字典时才提取，如果是雅可比计算传进来的纯张量，则直接跳过
+            obs = obs[("agents", "observation")]
+        
+        # 现在 obs 已经是一个标准的 torch.Tensor，形状为 [Batch, N]
+        # 下面的计算将不再报错
+
         actor_features = self.encoder(obs)
         if self.rnn is not None:
             actor_features, rnn_state = self.rnn(actor_features, rnn_state, is_init)    

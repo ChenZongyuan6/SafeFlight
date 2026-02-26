@@ -1,7 +1,10 @@
 # origin
 update_sim: True
 name: air
+LPF_coef: 1.0 # low-pass filter, 1.0 means all pass
 target_clip: 1.0
+
+min_thrust_ratio: 0.0
 max_thrust_ratio: 1.0
 fixed_yaw: 0
 inertia:
@@ -20,6 +23,8 @@ inertia:
   # yz: 0.0
   # zz: 0.005088960
 mass: 0.783 # add 0.147(imu and rotors), old 0.804
+#2025-202601 used: 0.783 total: 0.93
+#total mass = mass(here) + 0.147(imu and rotors)
 l: 0.250
 drag_coef: 0.0
 rotor_configuration:

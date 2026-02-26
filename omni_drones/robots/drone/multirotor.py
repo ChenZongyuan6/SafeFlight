@@ -238,10 +238,47 @@ class MultirotorBase(RobotBase):
             - self.pos[0].unsqueeze(1)
         )
         self.rotor_pos_offset = torch.zeros(*self.shape, self.num_rotors, 3, device=self.device)
+        
+        # ---------- MASS DEBUG (print once) ----------
+        if not hasattr(self, "_mass_debug_printed"):
+            self._mass_debug_printed = False
+
+        if not self._mass_debug_printed:
+            try:
+                base_before = self.base_link.get_masses()
+                body_before = self._view.get_body_masses()
+                logging.info(f"[MASS DEBUG][BEFORE] base_link masses env0: {base_before[0].detach().cpu().numpy()}")
+                logging.info(f"[MASS DEBUG][BEFORE] body masses sum env0: {body_before[0].sum().item():.6f}")
+                # rotor masses (may fail if rotors are not rigid bodies)
+                try:
+                    rotor_before = self.rotors_view.get_masses()
+                    logging.info(f"[MASS DEBUG][BEFORE] rotors masses env0: {rotor_before[0].detach().cpu().numpy()}")
+                except Exception as e:
+                    logging.info(f"[MASS DEBUG][BEFORE] rotors masses not available: {type(e).__name__}: {e}")
+            except Exception as e:
+                logging.info(f"[MASS DEBUG][BEFORE] failed: {type(e).__name__}: {e}")
 
         # set by yaml
         self.masses = torch.ones_like(self.base_link.get_masses().clone()) * self.mass
         self.base_link.set_masses(self.masses)
+
+        # ---------- MASS DEBUG (after) ----------
+        if not self._mass_debug_printed:
+            try:
+                base_after = self.base_link.get_masses()
+                body_after = self._view.get_body_masses()
+                logging.info(f"[MASS DEBUG][AFTER ] base_link masses env0: {base_after[0].detach().cpu().numpy()}")
+                logging.info(f"[MASS DEBUG][AFTER ] body masses sum env0: {body_after[0].sum().item():.6f}")
+                try:
+                    rotor_after = self.rotors_view.get_masses()
+                    logging.info(f"[MASS DEBUG][AFTER ] rotors masses env0: {rotor_after[0].detach().cpu().numpy()}")
+                except Exception as e:
+                    logging.info(f"[MASS DEBUG][AFTER ] rotors masses not available: {type(e).__name__}: {e}")
+            except Exception as e:
+                logging.info(f"[MASS DEBUG][AFTER ] failed: {type(e).__name__}: {e}")
+            self._mass_debug_printed = True
+        # ---------------------------------------------
+
         # self.gravity = self.masses * 9.81
         self.gravity = self._view.get_body_masses().sum(-1).unsqueeze(-1) * 9.81
         # self.inertias = self.base_link.get_inertias().reshape(*self.shape, 3, 3).diagonal(0, -2, -1)

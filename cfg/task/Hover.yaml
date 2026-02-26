@@ -7,9 +7,9 @@ defaults:
 
 env:
   num_envs: 4096
-  max_episode_length: 500
+  max_episode_length: 1000  # 500
 
-drone_model: crazyflie
+drone_model: Air   #crazyflie
 force_sensor: false
 
 reward_action_smoothness_weight: 0.0
@@ -17,14 +17,14 @@ reward_distance_scale: 10.0
 
 # flag
 use_disturbance: 0
-use_eval: 0
+use_eval: true #0
 use_rotor2critic: 0 # need to set critic_input = 'state'
 action_history_step: 5
 
 # observation options
 time_encoding: false
 
-action_transform: PIDrate # PIDrate_FM
+action_transform: PIDrate_FM # crazyfly: PIDrate Air : PIDrate_FM
 
 # sim2real options
 add_noise: false

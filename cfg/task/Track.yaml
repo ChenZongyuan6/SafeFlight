@@ -6,10 +6,10 @@ defaults:
   - /base/sim_base@_here_
 
 env:
-  num_envs: 8192
+  num_envs: 8192  #8192
   max_episode_length: 1000
 
-drone_model: Crazyflie # air
+drone_model: Air #Crazyflie air
 force_sensor: false
 time_encoding: false
 wind: false
@@ -21,8 +21,8 @@ reset_thres: 1.
 future_traj_steps: 10
 time_encoding_dim: 4
 
-use_eval: 0
-eval_traj: 'normal' # poly, zigzag, pentagram, slow, normal, fast
+use_eval: 0    #ture 0
+eval_traj: 'fast' # poly, zigzag, pentagram, slow, normal, fast
 use_rotor2critic: 0 # need to set critic_input = 'state'
 use_action_history: false
 action_history_step: 5
@@ -55,7 +55,12 @@ reward_norm_max: 0.0
 # distance
 reward_distance_scale: 5.0
 
-action_transform: PIDrate # PIDrate_FM
+action_transform: PIDrate_FM #crazyfly use: PIDrate  Air use: PIDrate_FM
+
+# 扁平化
+flatten_obs: false
+flatten_state: false  # 建议同时扁平化 state，以防 Critic 报错
+
 # history: true
 # randomization:
 #   drone:

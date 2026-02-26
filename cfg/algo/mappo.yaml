@@ -31,7 +31,8 @@ actor:
   attn_encoder: PartialAttentionEncoder # if applicable
   use_orthogonal: true
 
-  tanh: false
+  tanh: false #false
+  jacobian_coef:  0  #0.01  # 这是 FlipNet 论文中提到的惩罚力度系数
 
   # rnn:
   #   cls: gru

@@ -24,8 +24,7 @@
 import time
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-# from functorch import vmap
-from functorch import vmap, jacrev
+from functorch import vmap
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -253,49 +252,6 @@ class MAPPOPolicy(object):
         )
         actor_input.batch_size = [*actor_input.batch_size, self.agent_spec.n]
 
-        j_coef = self.cfg.actor.get("jacobian_coef", 0)
-        jacobian_loss = torch.tensor(0.0, device=self.device)
-
-        # ==========================================================
-        # --- [核心修改]：正确且隔离的函数式 Jacobian 计算 ---
-        # ==========================================================
-        
-        # 1. 定义针对“单无人机、单状态”的纯函数
-        def get_mu_single(single_obs, single_params):
-            # 将 Tensor 包装回 TensorDict 以适配 Actor 接口
-            # 注意：这里的 single_obs 维度是 [obs_dim]
-            td = TensorDict({self.obs_name: single_obs}, batch_size=[], device=single_obs.device)
-            # 必须使用传入的 single_params 才能保证梯度传导
-            res_td = self.actor(td, single_params, deterministic=True)
-            return res_td[self.act_name] # 返回 [act_dim]
-
-        # 2. 准备数据：彻底隔离输入，防止 requires_grad 泄露
-        obs = actor_input[self.obs_name].detach() # 确保 obs 是干净的
-        params = self.actor_params
-
-        # 3. 构造 Jacobian 算子并处理 Batch + Agent 维度
-        # jacrev(get_mu_single) 计算的是 [act_dim, obs_dim] 的导数矩阵
-        jac_func = jacrev(get_mu_single, argnums=0)
-
-        # 使用嵌套 vmap：外层映射 Batch (dim 0)，内层映射 Agent (dim 1)
-        if self.cfg.share_actor:
-            # 共享参数：params 对所有 Batch/Agent 都是 None (即不随维度变化)
-            # in_dims: (obs 的映射维, params 的映射维)
-            inner_vmap = vmap(jac_func, in_dims=(0, None)) # 映射 Agent 维
-            jac_op = vmap(inner_vmap, in_dims=(0, None))   # 映射 Batch 维
-            jac = jac_op(obs, params)
-        else:
-            # 非共享参数：params 随 Agent (dim 1) 变化
-            inner_vmap = vmap(jac_func, in_dims=(0, 0))    # 映射 Agent 维
-            jac_op = vmap(inner_vmap, in_dims=(0, None))   # 映射 Batch 维
-            jac = jac_op(obs, params)
-
-        # 4. 计算 Jacobian 范数
-        # jac 维度为 [Batch, Agent, Act_Dim, Obs_Dim]
-        # pow(2).sum() 计算 Frobenius 范数的平方
-        jacobian_loss = jac.pow(2).sum(dim=(-1, -2)).mean()
-        jacobian_loss_mapped = torch.tanh(jacobian_loss / 5.0) * 5.0
-        
         log_probs_old = batch[self.act_logps_name]
         if hasattr(self, "minibatch_seq_len"): # [N, T, A, *]
             actor_output = vmap(self.actor, in_dims=(2, 0), out_dims=2)(
@@ -327,32 +283,18 @@ class MAPPOPolicy(object):
             entropy_loss = - torch.mean(-log_probs_new)
 
         self.actor_opt.zero_grad()
-        # # 这里把三项 Loss 合并在一起，j_coef 为 0 时它就退化回原版逻辑
-        # total_loss = policy_loss + entropy_loss * self.cfg.entropy_coef + jacobian_loss * j_coef
-        # total_loss.backward()
-
-        # 20260107第二次修改
-        # 最终合并 Loss
-        # 即使 j_coef 为 0，这里的计算也是安全的，因为 jac 是独立生成的
-        (policy_loss + entropy_loss * self.cfg.entropy_coef + jacobian_loss_mapped * j_coef).backward()
-            #原版
-        # (policy_loss + entropy_loss * self.cfg.entropy_coef).backward()
+        (policy_loss + entropy_loss * self.cfg.entropy_coef).backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(
             self.actor_opt.param_groups[0]["params"], self.cfg.max_grad_norm
         )
         self.actor_opt.step()
 
         ess = (2 * ratio.logsumexp(0) - (2 * ratio).logsumexp(0)).exp().mean() / ratio.shape[0]
-        weighted_jacobian = jacobian_loss.item() * j_coef
         return {
             "policy_loss": policy_loss.item(),
             "actor_grad_norm": grad_norm.item(),
             "entropy": - entropy_loss.item(),
-            "ESS": ess.item(),
-            # 记录原始jacobian损失，观察网络的平滑程度
-            "jacobian_loss_raw": jacobian_loss.item(),
-            # 记录加权损失，直接与 policy_loss 对比权重
-            "jacobian_loss_weighted": weighted_jacobian
+            "ESS": ess.item()
         }
 
     def update_critic(self, batch: TensorDict) -> Dict[str, Any]:

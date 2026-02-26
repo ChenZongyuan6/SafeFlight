@@ -7,12 +7,19 @@ sim: ${task.sim}
 env: ${task.env}
 
 model_dir: null
+#/root/SimpleFlight/scripts/outputs/hover/02-05_11-44/wandb/latest-run/files/checkpoint_final.pt
+#/root/SimpleFlight/scripts/outputs/track_None/12-15_01-22/wandb/latest-run/files/checkpoint_final.pt
+#/root/SimpleFlight/scripts/outputs/track_None/01-08_15-49/wandb/latest-run/files/checkpoint_final.pt
+#/root/SimpleFlight/scripts/outputs/track_None/01-07_23-25/wandb/latest-run/files/checkpoint_996671488.pt
+#/root/SimpleFlight/scripts/outputs/track_None/12-15_01-22/wandb/latest-run/files/checkpoint_996671488.pt
+# /root/SimpleFlight/scripts/outputs/track/12-10_17-54/wandb/latest-run/files/checkpoint_1992818688.pt
+#null
 
 total_frames: 9000_000_000 #1000_000_000
 max_iters: -1
 eval_interval: -1
 save_interval: 100
-seed: 0
+seed: 42           #original simpleflight：0
 
 viewer:
   resolution: [960, 720]
@@ -24,10 +31,11 @@ viewer:
 
 wandb:
   group: ${oc.select:..task.name}
-  run_name: track
+  run_name: hover  #track
+  #_Li${algo.actor.jacobian_coef}
   # run_name: debug
   job_type: train
-  entity: chenjy
+  entity: chen_zongy-tsinghua-university
   project: sim2real
   # mode: disabled
   mode: online # set to 'disabled' when debugging locally, online
@@ -36,7 +44,7 @@ wandb:
   tags: 
 
 defaults:
-  - task: Track
-  # - task: Hover
+  - task: Hover
+  # - task: Hover Track
   - algo: mappo
   - _self_
