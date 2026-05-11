@@ -1,0 +1,124 @@
+name: TrackDATT0427   # 原值: TrackDATT
+# -----------------------------------------------------------------------
+# DATT GT-oracle baseline（0427 扰动模型更新版）
+# Phase 1: single end-to-end MAPPO policy with GT wind vector in obs.
+# This is the oracle upper bound (DATT arXiv:2310.09053, Phase 1).
+# 在原 TrackDATT 基础上新增 composite 扰动模型支持。
+# -----------------------------------------------------------------------
+
+defaults:
+  - /base/env_base@_here_
+  - /base/sim_base@_here_
+
+env:
+  num_envs: 4096
+  max_episode_length: 1000
+
+drone_model: Air
+force_sensor: false
+time_encoding: false
+wind: true
+
+latency: false
+latency_step: 1
+random_latency: true
+
+# ---- DATT-specific ----
+# wind_mode 在 disturbance.enable=false 时生效（向后兼容）
+# wind_mode: "sinusoidal"  -- identical to Track (8-freq sinusoidal), default, fair comparison
+# wind_mode: "constant"   -- episode-constant wind (original DATT paper setting)
+wind_mode: "sinusoidal"
+wind_max: 1.0            # only used when wind_mode=constant, [m/s^2] per axis
+include_gt_wind: true    # append GT wind acceleration to obs (the adaptive input)
+
+# ---- trajectory ----
+reset_thres: 1.
+future_traj_steps: 10
+time_encoding_dim: 4
+
+# ---- eval ----
+use_eval: false    ###
+eval_traj: 'normal'
+
+# ---- misc ----
+use_rotor2critic: 0
+use_action_history: false
+action_history_step: 5
+use_ab_wolrd_pos: false
+
+# ---- reward weights ----
+reward_up_weight: 1.0
+reward_spin_weight: 1.0
+reward_acc_weight_init: 0.0
+reward_acc_weight_lr: 0.0005
+reward_acc_max: 0.0
+reward_jerk_weight_init: 0.0
+reward_jerk_weight_lr: 0.0005
+reward_jerk_max: 0.0
+reward_snap_weight_init: 0.0
+reward_snap_weight_lr: 0.0005
+reward_snap_max: 0.0
+reward_action_smoothness_weight_init: 0.0
+reward_action_smoothness_weight_lr: 0.0
+reward_smoothness_max: 0.0
+reward_action_norm_weight_init: 0.0
+reward_action_norm_weight_lr: 0.0001
+reward_norm_max: 0.0
+reward_distance_scale: 5.0
+
+action_transform: PIDrate_FM
+flatten_obs: false
+flatten_state: false
+
+# ================================================================
+# 扰动模型配置（新增，0427）
+# 替代/扩展原有的 wind 扰动（当 enable=true 时）
+# mode: "sinsum"    -> 原有的多频率正弦叠加（与 wind_mode=sinusoidal 等价）
+#        "composite" -> 偏置 + Gauss-Markov随机 + 摆动正弦（新模型）
+# ================================================================
+disturbance:
+  enable: true
+  mode: "composite"        # "sinsum" | "composite"
+
+  # 仅应用水平（x-y）扰动，z方向为0
+  horizontal_only: false
+
+  # 将所有分量求和后的总水平扰动范数进行截断
+  clip_total: false
+
+  # ============================================================
+  # [mode: sinsum] 原有的多频率正弦叠加参数
+  # a(t) = intensity * sum_j sin(w_j * t),  w_j ~ N(0,1)
+  # ============================================================
+  sinsum:
+    intensity_range: [0.0, 2.0]   # 每个环境的随机强度标量
+    num_freqs: 8                  # 每个轴的频率分量数量
+
+  # ============================================================
+  # [mode: composite] 新型三分量模型
+  # a_dist = clip_xy(a_bias + a_gm + a_swing, max_total_acc)
+  # ============================================================
+
+  # 分量 1：常值偏置
+  bias:
+    enable: true
+    range_train: [-2.0, 2.0]   # m/s^2，每轴独立均匀采样
+    range_eval:  [-2.0, 2.0]   # m/s^2，与训练相同
+
+  # 分量 2：Gauss-Markov随机扰动
+  # a_gm[k+1] = alpha * a_gm[k] + sigma * sqrt(1-alpha^2) * eps
+  gauss_markov:
+    enable: true
+    sigma_range_train: [0.2, 0.8]   # m/s^2，稳态标准差
+    sigma_range_eval:  [0.2, 0.8]   # m/s^2，与训练相同
+    tau_range: [0.5, 2.0]           # 秒，相关时间
+    reset_to_zero: true
+
+  # 分量 3：摆动正弦（悬挂负载钟摆模型）
+  # a_swing_xy(t) = A_xy * sin(2*pi*f_s*t + phi_xy)
+  swing:
+    enable: true
+    amp_range_train: [0.0, 0.5]    # m/s^2，每轴的幅值
+    amp_range_eval:  [0.0, 0.5]    # m/s^2，与训练相同
+    freq_range: [0.3, 1.2]         # Hz，类似钟摆的频率范围
+    random_phase: true             # phi ~ U(0, 2*pi)

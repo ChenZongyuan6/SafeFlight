@@ -1,0 +1,185 @@
+import torch
+import torch.nn as nn
+import matplotlib.pyplot as plt
+import numpy as np
+import os
+import re  # 【新增】用于从路径中提取时间字符串
+# ==========================================
+# 1. 复制你的网络结构 (必须和训练时完全一致)
+# ==========================================
+class CausalConv1d(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, dilation=1):
+        super().__init__()
+        self.padding = (kernel_size - 1) * dilation
+        self.conv = nn.Conv1d(in_channels, out_channels, kernel_size, padding=self.padding, dilation=dilation)
+
+    def forward(self, x):
+        x = self.conv(x)
+        if self.padding > 0:
+            x = x[:, :, :-self.padding]
+        return x
+
+class PI_WAN(nn.Module):
+    def __init__(self, input_dim=19, output_dim=3, hidden_dim=64):
+        super().__init__()
+        self.net = nn.Sequential(
+            CausalConv1d(input_dim, hidden_dim, kernel_size=3, dilation=1),
+            nn.ReLU(), nn.BatchNorm1d(hidden_dim),
+            CausalConv1d(hidden_dim, hidden_dim, kernel_size=3, dilation=2),
+            nn.ReLU(), nn.BatchNorm1d(hidden_dim),
+            CausalConv1d(hidden_dim, hidden_dim, kernel_size=3, dilation=4),
+            nn.ReLU(), nn.BatchNorm1d(hidden_dim),
+            CausalConv1d(hidden_dim, hidden_dim, kernel_size=3, dilation=8),
+            nn.ReLU(), nn.BatchNorm1d(hidden_dim),
+        )
+        self.head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, output_dim) 
+        )
+
+    def forward(self, x):
+        x = x.permute(0, 2, 1)
+        feat = self.net(x)
+        feat_last = feat[:, :, -1] 
+        out = self.head(feat_last)
+        return out
+
+# ==========================================
+# 2. 评估主函数
+# ==========================================
+def evaluate_and_plot():
+    # --- 配置路径 ---
+    train_data_path = "collected_data/dataset_20260316_0028/dataset_20260316_0028.pt"
+    #collected_data/dataset_20260505_0156/dataset_test_20260505_0156.pt #新复合扰动的训练集 测试时用于计算归一化参数
+    #collected_data/dataset_20260316_0028/dataset_20260316_0028.pt #原版正弦叠加的训练集 测试时用于计算归一化参数
+    test_data_path  = "collected_data/dataset_20260316_1153/dataset_test_20260316_1153.pt"
+    #collected_data/dataset_20260506_0322/dataset_test_20260506_0322.pt #新复合扰动的
+    #collected_data/dataset_20260316_1153/dataset_test_20260316_1153.pt  #原版正弦叠加扰动的测试
+    model_path      = "pinncheckpoint/05_05_14_44/best_pi_wan_model.pth"
+
+    window_size   = 5
+    start_env_idx = 0   # 起始轨迹编号（含）
+    end_env_idx   = 11   # 结束轨迹编号（含）
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Loading model onto {device}...")
+
+    # --- 1. 获取归一化参数（与训练时保持一致）---
+    train_data = torch.load(train_data_path)["inputs"].float()
+    split_idx  = int(train_data.shape[0] * 0.9)
+    flat_train = train_data[:split_idx].reshape(-1, train_data.shape[-1])
+    mean = flat_train.mean(dim=0).to(device)
+    std  = flat_train.std(dim=0).to(device) + 1e-6
+    print("Normalization stats loaded.")
+
+    # --- 2. 加载测试集 ---
+    test_dataset = torch.load(test_data_path)
+    test_inputs  = test_dataset["inputs"].float().to(device)   # [Envs, Time, 19]
+    test_labels  = test_dataset["labels"].float().to(device)   # [Envs, Time, 3]
+
+    # --- 3. 加载模型 ---
+    model = PI_WAN(input_dim=19, output_dim=3).to(device)
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.eval()
+
+    # --- 动态保存目录与时间戳 ---
+    match = re.search(r'(\d{8})_(\d{4})', test_data_path)
+    dataset_time = f"{match.group(1)[-4:]}_{match.group(2)}" if match else "unknown_time"
+    base_save_dir = os.path.dirname(model_path)
+    os.makedirs(base_save_dir, exist_ok=True)
+
+    all_rmse = []   # 汇总每条轨迹的误差
+
+    # --- 4. 遍历指定范围的轨迹 ---
+    for env_idx in range(start_env_idx, end_env_idx + 1):
+        traj_inputs = test_inputs[env_idx]   # [Time, 19]
+        traj_labels = test_labels[env_idx]   # [Time, 3]
+        total_steps = traj_inputs.shape[0]
+
+        traj_inputs_norm = (traj_inputs - mean) / std
+
+        preds, gts = [], []
+        print(f"[Env {env_idx}] Inferring {total_steps} steps ...")
+        with torch.no_grad():
+            for t in range(window_size, total_steps):
+                x_win  = traj_inputs_norm[t - window_size : t, :].unsqueeze(0)  # [1, W, 19]
+                d_pred = model(x_win).squeeze(0)                                 # [3]
+                d_gt   = traj_labels[t - 1, :]                                   # [3]
+                preds.append(d_pred.cpu().numpy())
+                gts.append(d_gt.cpu().numpy())
+
+        preds = np.array(preds)   # [T, 3]
+        gts   = np.array(gts)     # [T, 3]
+
+        rmse_x  = np.sqrt(np.mean((gts[:, 0] - preds[:, 0]) ** 2))
+        rmse_y  = np.sqrt(np.mean((gts[:, 1] - preds[:, 1]) ** 2))
+        rmse_z  = np.sqrt(np.mean((gts[:, 2] - preds[:, 2]) ** 2))
+        rmse_3d = np.sqrt(np.mean(np.sum((preds - gts) ** 2, axis=1)))
+        all_rmse.append({"env": env_idx, "x": rmse_x, "y": rmse_y, "z": rmse_z, "3d": rmse_3d})
+
+        # --- 绘图（每条轨迹一张图）---
+        time_axis  = np.arange(len(preds)) * 0.02
+        axis_names = ["X", "Y", "Z"]
+        rmse_vals  = [rmse_x, rmse_y, rmse_z]
+
+        fig, axs = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
+        for i in range(3):
+            axs[i].plot(time_axis, gts[:, i],  label="Ground Truth",   color="black", linewidth=1.5, linestyle="--")
+            axs[i].plot(time_axis, preds[:, i], label="PINN Predicted", color="red",   linewidth=1.5, alpha=0.8)
+            axs[i].set_ylabel(f"Disturbance {axis_names[i]} (m/s²)")
+            axs[i].legend(loc="upper right")
+            axs[i].grid(True, linestyle=":", alpha=0.6)
+            axs[i].set_title(f"Axis {axis_names[i]}  RMSE: {rmse_vals[i]:.4f} m/s²")
+        axs[-1].set_xlabel("Time (s)")
+        plt.suptitle(
+            f"Env {env_idx}  —  PINN Disturbance Estimation\n"
+            f"RMSE  X: {rmse_x:.4f}   Y: {rmse_y:.4f}   Z: {rmse_z:.4f}   3D: {rmse_3d:.4f}  m/s²",
+            fontsize=13
+        )
+        plt.tight_layout()
+
+        fig_path = os.path.join(base_save_dir, f"DOB_test_{dataset_time}_env{env_idx}.png")
+        plt.savefig(fig_path, dpi=300)
+        plt.close(fig)
+        print(f"  Saved: {fig_path}")
+
+    # --- 5. 汇总统计 ---
+    mean_x  = np.mean([r["x"]  for r in all_rmse])
+    mean_y  = np.mean([r["y"]  for r in all_rmse])
+    mean_z  = np.mean([r["z"]  for r in all_rmse])
+    mean_3d = np.mean([r["3d"] for r in all_rmse])
+
+    sep = "-" * 56
+    lines = [
+        "=== PINN Evaluation Summary ===",
+        f"Model     : {model_path}",
+        f"Test data : {test_data_path}",
+        f"Env range : [{start_env_idx}, {end_env_idx}]",
+        "",
+        f"{'Env':>5}  {'RMSE_X':>10}  {'RMSE_Y':>10}  {'RMSE_Z':>10}  {'RMSE_3D':>10}",
+        sep,
+    ]
+    for r in all_rmse:
+        lines.append(f"{r['env']:>5}  {r['x']:>10.4f}  {r['y']:>10.4f}  {r['z']:>10.4f}  {r['3d']:>10.4f}")
+    lines += [
+        sep,
+        f"{'Mean':>5}  {mean_x:>10.4f}  {mean_y:>10.4f}  {mean_z:>10.4f}  {mean_3d:>10.4f}",
+        "",
+        "(All RMSE in m/s²)",
+    ]
+
+    print("\n" + "\n".join(lines))
+
+    txt_path = os.path.join(
+        base_save_dir,
+        f"eval_summary_{dataset_time}_env{start_env_idx}to{end_env_idx}.txt"
+    )
+    with open(txt_path, "w") as f:
+        f.write("\n".join(lines))
+    print(f"\nSummary saved to: {txt_path}")
+
+
+
+if __name__ == "__main__":
+    evaluate_and_plot()

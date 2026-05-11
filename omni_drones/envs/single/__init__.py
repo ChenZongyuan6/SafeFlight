@@ -24,3 +24,8 @@
 from .hover import Hover
 from .track import Track
 from .track_pinn import TrackPINN
+from .track_pinn_0504 import TrackPINN0504
+from .track_resid_gain import TrackResidGain
+from .track_residual import TrackResidual
+from .track_datt import TrackDATT
+from .track_datt0427 import TrackDATT0427  # 原值: 无（0427新增）

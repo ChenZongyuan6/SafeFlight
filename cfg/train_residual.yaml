@@ -1,0 +1,41 @@
+headless: true
+use_local_usd: false
+
+sim: ${task.sim}
+env: ${task.env}
+
+model_dir: /root/SimpleFlight/scripts/outputs/track_residual/04-16_01-48/wandb/latest-run/files/checkpoint_629407744.pt
+#null
+
+total_frames: 1000_000_000
+max_iters: -1
+eval_interval: -1
+save_interval: 100
+seed: 0
+
+viewer:
+  resolution: [960, 720]
+  eye: [0., 2.0, 2.5]
+  lookat: [0., 0., 1.0]
+
+wandb:
+  group: ${oc.select:..task.name}
+  run_name: track_residual
+  job_type: train
+  entity: chen_zongy-tsinghua-university
+  project: sim2real
+  mode: online
+  run_id:
+  monitor_gym: True
+  tags:
+
+defaults:
+  - task: TrackResidual
+  - algo: mappo
+  - _self_
+
+algo:
+  entropy_coef: 0.01
+  entropy_coef_final: 0.0
+  clip_param: 0.1
+

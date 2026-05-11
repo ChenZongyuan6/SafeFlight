@@ -1,0 +1,116 @@
+name: TrackResidGain
+
+defaults:
+  - /base/env_base@_here_
+  - /base/sim_base@_here_
+
+env:
+  num_envs: 4096
+  max_episode_length: 1000
+
+drone_model: Air
+force_sensor: false
+time_encoding: false
+wind: true
+latency: false
+latency_step: 1
+random_latency: true
+
+reset_thres: 1.0
+future_traj_steps: 10
+time_encoding_dim: 4
+
+use_eval: false
+eval_traj: "normal"   # poly, zigzag, pentagram, slow, normal, fast
+use_rotor2critic: 0
+use_action_history: false
+action_history_step: 5
+use_ab_wolrd_pos: false
+
+# reward weights
+reward_up_weight: 1.0
+reward_spin_weight: 1.0
+
+reward_acc_weight_init: 0.0
+reward_acc_weight_lr: 0.0005
+reward_acc_max: 0.0
+
+reward_jerk_weight_init: 0.0
+reward_jerk_weight_lr: 0.0005
+reward_jerk_max: 0.0
+
+reward_snap_weight_init: 0.0
+reward_snap_weight_lr: 0.0005
+reward_snap_max: 0.0
+
+reward_action_smoothness_weight_init: 0.5
+reward_action_smoothness_weight_lr: 0.0005
+reward_smoothness_max: 0.5
+
+reward_action_norm_weight_init: 0.0
+reward_action_norm_weight_lr: 0.0001
+reward_norm_max: 0.0
+
+reward_distance_scale: 5.0
+
+action_transform: PIDrate_FM
+
+flatten_obs: false
+flatten_state: false
+
+# =========================
+# structured gain compensation settings
+# =========================
+# 混合系数: final_ctbr = base + gain_alpha * comp
+gain_alpha: 0.7
+
+# 增益网络大小，null 表示使用 mappo.yaml 默认值
+# 建议使用小网络，例: [64] 或 [32, 32]
+gain_hidden_units: [64]
+
+# 增益上限：tanh 输出 [-1,1] 映射到 [0, gain_K_max]
+gain_K_max: 5.0
+
+# 增益 observation 维度
+#   [delta_phi_des(1), delta_theta_des(1), p(1), q(1), r(1), phi(1), theta(1)] = 7
+gain_obs_dim: 46
+
+# 增益 action 维度: [K_phi, K_theta]
+gain_action_dim: 2
+
+# 解析 ΔCT 裁剪范围 (CTBR space)
+delta_ct_limit: 0.4
+
+# 解析 rate 补偿裁剪 (CTBR space, 乘完 K*Δangle 之后)
+delta_rate_limit: 0.5
+
+# gain regularization in reward
+gain_penalty_coef: 0.0
+gain_smoothness_coef: 0.002
+
+# =========================
+# trained gain policy path (used by eval_resid_gain.py)
+# =========================
+gain_model_dir: /root/SimpleFlight/scripts/outputs/track_resid_gain/04-06_14-42/wandb/latest-run/files/checkpoint_262406144.pt
+#/root/SimpleFlight/scripts/outputs/track_resid_gain/04-06_03-08/wandb/latest-run/files/checkpoint_865337344.pt
+#/root/SimpleFlight/scripts/outputs/track_resid_gain/04-03_03-02/wandb/latest-run/files/checkpoint_1992556544.pt
+#/root/SimpleFlight/scripts/outputs/track_resid_gain/04-02_11-47/wandb/latest-run/files/checkpoint_498335744.pt
+
+# =========================
+# frozen base policy path
+# =========================
+base_model_dir: /root/SimpleFlight/scripts/outputs/track_None/12-15_01-22/wandb/latest-run/files/checkpoint_final.pt
+
+# =========================
+# frozen PINN path
+# =========================
+pinn_model_dir: /root/SimpleFlight/scripts/pinncheckpoint/03_20_04_00/best_pi_wan_model.pth
+
+pinn_stats_dataset: /root/SimpleFlight/scripts/collected_data/dataset_20260316_0028/dataset_20260316_0028.pt
+pinn_train_ratio: 0.9
+
+# PINN structure
+pinn_input_dim: 19
+pinn_output_dim: 3
+pinn_hidden_dim: 64
+pinn_window_size: 5

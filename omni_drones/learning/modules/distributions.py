@@ -77,7 +77,7 @@ class DiagGaussian(nn.Module):
 
     def forward(self, x):
         action_mean = self.fc_mean(x)
-        action_std = torch.broadcast_to(torch.exp(self.log_std), action_mean.shape)
+        action_std = torch.broadcast_to(torch.exp(self.log_std.clamp(-4.0, 1.5)), action_mean.shape)
         dist = D.Independent(D.Normal(action_mean, action_std), 1)
         return dist
 
@@ -203,7 +203,7 @@ class IndependentNormalModule(nn.Module):
             scale = self.scale_mapping(scale).clamp_min(self.scale_lb)
         else:
             loc, scale = self.operator(tensor), self.scale_mapping(
-                self.log_std
+                self.log_std.clamp(-4.0, 1.5)
             ).clamp_min(self.scale_lb)
         return IndependentNormal(loc, scale)
 

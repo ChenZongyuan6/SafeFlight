@@ -1,0 +1,38 @@
+headless: true
+use_local_usd: false
+
+sim: ${task.sim}
+env: ${task.env}
+
+model_dir: null
+
+total_frames: 2000_000_000
+max_iters: -1
+eval_interval: -1
+save_interval: 100
+seed: 0
+
+viewer:
+  resolution: [960, 720]
+  eye: [0., 2.0, 2.5]
+  lookat: [0., 0., 1.0]
+
+wandb:
+  group: ${oc.select:..task.name}
+  run_name: track_resid_gain
+  job_type: train
+  entity: chen_zongy-tsinghua-university
+  project: sim2real
+  mode: online
+  run_id:
+  monitor_gym: True
+  tags:
+
+defaults:
+  - task: TrackResidGain
+  - algo: mappo
+  - _self_
+
+algo:
+  entropy_coef: 0.001
+  clip_param: 0.1

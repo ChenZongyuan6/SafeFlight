@@ -1,0 +1,948 @@
+import logging
+import os
+import copy
+from typing import Sequence, Optional
+
+import hydra
+import torch
+import torch.nn as nn
+import numpy as np
+import wandb
+
+from omegaconf import OmegaConf, open_dict
+from tensordict import TensorDict, TensorDictBase
+
+from omni_drones import CONFIG_PATH, init_simulation_app
+from omni_drones.utils.torchrl import SyncDataCollector, AgentSpec
+from omni_drones.utils.torchrl.transforms import (
+    FromMultiDiscreteAction,
+    FromDiscreteAction,
+    ravel_composite,
+    History,
+)
+from omni_drones.utils.wandb import init_wandb
+from omni_drones.learning import (
+    MAPPOPolicy,
+    HAPPOPolicy,
+    QMIXPolicy,
+    DQNPolicy,
+    SACPolicy,
+    TD3Policy,
+    MATD3Policy,
+    TDMPCPolicy,
+    Policy,
+    PPOPolicy,
+    PPOAdaptivePolicy,
+    PPORNNPolicy,
+)
+
+from setproctitle import setproctitle
+from torchrl.envs.transforms import (
+    TransformedEnv,
+    InitTracker,
+    Compose,
+)
+
+from torchrl.data import UnboundedContinuousTensorSpec, CompositeSpec
+from tqdm import tqdm
+
+
+# ============================================================
+# 1. 一些通用小工具
+# ============================================================
+
+class Every:
+    """
+    每隔固定步数执行一次 callback，主要用于评估时录视频。
+    """
+    def __init__(self, func, steps):
+        self.func = func
+        self.steps = steps
+        self.i = 0
+
+    def __call__(self, *args, **kwargs):
+        if self.i % self.steps == 0:
+            self.func(*args, **kwargs)
+        self.i += 1
+
+
+class EpisodeStats:
+    """
+    从 rollout / collector 数据中提取 episode 结束时的统计量。
+    和你原 train.py 里的实现保持一致。
+    """
+    def __init__(self, in_keys: Sequence[str] = None):
+        self.in_keys = in_keys
+        self._stats = []
+        self._episodes = 0
+
+    def __call__(self, tensordict: TensorDictBase) -> TensorDictBase:
+        done = tensordict.get(("next", "done"))
+        truncated = tensordict.get(("next", "truncated"), None)
+        done_or_truncated = (done | truncated) if truncated is not None else done.clone()
+
+        if done_or_truncated.any():
+            done_or_truncated = done_or_truncated.squeeze(-1)  # [env_num, 1]
+            self._episodes += done_or_truncated.sum().item()
+            self._stats.extend(
+                tensordict.select(*self.in_keys)[:, 1:][done_or_truncated[:, :-1]].clone().unbind(0)
+            )
+
+    def pop(self):
+        stats: TensorDictBase = torch.stack(self._stats).to_tensordict()
+        self._stats.clear()
+        return stats
+
+    def __len__(self):
+        return len(self._stats)
+
+
+# ============================================================
+# 2. PINN 网络定义（保持与你当前训练时一致）
+# ============================================================
+
+class CausalConv1d(nn.Module):
+    """
+    因果卷积，保证当前时刻输出只依赖历史和当前，不依赖未来。
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, dilation=1):
+        super().__init__()
+        self.padding = (kernel_size - 1) * dilation
+        self.conv = nn.Conv1d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            padding=self.padding,
+            dilation=dilation
+        )
+
+    def forward(self, x):
+        x = self.conv(x)
+        if self.padding > 0:
+            x = x[:, :, :-self.padding]
+        return x
+
+
+class PI_WAN(nn.Module):
+    """
+    你当前 PINN / TCN 扰动估计器的网络结构。
+    输入: [B, W, C]
+    输出: [B, 3]
+    """
+    def __init__(self, input_dim=19, output_dim=3, hidden_dim=64):
+        super().__init__()
+        self.net = nn.Sequential(
+            CausalConv1d(input_dim, hidden_dim, kernel_size=3, dilation=1),
+            nn.ReLU(), nn.BatchNorm1d(hidden_dim),
+            CausalConv1d(hidden_dim, hidden_dim, kernel_size=3, dilation=2),
+            nn.ReLU(), nn.BatchNorm1d(hidden_dim),
+            CausalConv1d(hidden_dim, hidden_dim, kernel_size=3, dilation=4),
+            nn.ReLU(), nn.BatchNorm1d(hidden_dim),
+            CausalConv1d(hidden_dim, hidden_dim, kernel_size=3, dilation=8),
+            nn.ReLU(), nn.BatchNorm1d(hidden_dim),
+        )
+        self.head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, output_dim)
+        )
+
+    def forward(self, x):
+        # x: [B, W, C] -> [B, C, W]
+        x = x.permute(0, 2, 1)
+        feat = self.net(x)
+        feat_last = feat[:, :, -1]
+        out = self.head(feat_last)
+        return out
+
+
+# ============================================================
+# 3. 读取 PINN 归一化统计量
+#    注意：你当前 PINN 推理依赖训练集 mean/std
+# ============================================================
+
+def load_pinn_stats_from_dataset(data_path: str, train_ratio: float = 0.9, device: str = "cuda"):
+    """
+    从 PINN 训练数据集中读取训练集部分，重新计算输入特征均值和方差。
+    这和你 eval_pinn.py 里的做法保持一致。
+
+    返回:
+        mean: [19]
+        std : [19]
+    """
+    loaded = torch.load(data_path)
+    inputs = loaded["inputs"].float()  # [Envs, Time, 19]
+
+    split_idx = int(inputs.shape[0] * train_ratio)
+    flat_train_inputs = inputs[0:split_idx].reshape(-1, inputs.shape[-1])
+
+    mean = flat_train_inputs.mean(dim=0).to(device)
+    std = flat_train_inputs.std(dim=0).to(device) + 1e-6
+    return mean, std
+
+
+# ============================================================
+# 4. 构造虚拟的 base policy spec
+#
+# 关键说明：
+# - 不能在同一个 Isaac Sim 进程里再创建第二个 Track 环境
+# - 因此这里直接根据 TrackResidual 环境里已经算好的
+#   base_obs_dim / base_state_dim 来手工构造 spec
+# - 这样主策略网络结构仍可与第一阶段保持一致
+# ============================================================
+
+class _VirtualEnvForAgentSpec:
+    """
+    一个最小化的“假环境”，只提供 agent_spec 初始化时可能需要访问的 spec。
+    """
+    def __init__(self, observation_spec, action_spec, reward_spec):
+        self.observation_spec = observation_spec
+        self.action_spec = action_spec
+        self.reward_spec = reward_spec
+
+
+def build_virtual_base_agent_spec(
+    num_envs: int,
+    obs_dim: int,
+    state_dim: int,
+    action_dim: int,
+    device: str = "cuda",
+):
+    """
+    手工构造一个和原始主策略输入/输出维度一致的 AgentSpec。
+
+    这里假设原主策略:
+    - observation: [1, obs_dim]
+    - state      : [state_dim]
+    - action     : [1, action_dim]
+    - reward     : [1, 1]
+    """
+    observation_spec = CompositeSpec({
+        "agents": {
+            "observation": UnboundedContinuousTensorSpec((1, obs_dim)),
+            "state": UnboundedContinuousTensorSpec((state_dim,)),
+        }
+    }).expand(num_envs).to(device)
+
+    action_spec = CompositeSpec({
+        "agents": {
+            "action": UnboundedContinuousTensorSpec((1, action_dim)),
+        }
+    }).expand(num_envs).to(device)
+
+    reward_spec = CompositeSpec({
+        "agents": {
+            "reward": UnboundedContinuousTensorSpec((1, 1)),
+        }
+    }).expand(num_envs).to(device)
+
+    agent_spec = AgentSpec(
+        "drone", 1,
+        observation_key=("agents", "observation"),
+        action_key=("agents", "action"),
+        reward_key=("agents", "reward"),
+        state_key=("agents", "state"),
+    )
+
+    # 构造一个最小虚拟环境，挂到 agent_spec 上
+    virtual_env = _VirtualEnvForAgentSpec(
+        observation_spec=observation_spec,
+        action_spec=action_spec,
+        reward_spec=reward_spec,
+    )
+
+    # 不同版本里 AgentSpec 访问 env 的方式可能不同，两个都挂上
+    agent_spec._env = virtual_env
+    agent_spec.env = virtual_env
+
+    return agent_spec
+
+
+# ============================================================
+# 5. FrozenBaseAndPinnResidualPolicy
+#    这是整个方案 B 的核心“编排器”
+#
+#    作用:
+#    - 接受环境当前 tensordict
+#    - 用冻结主策略推理 u_base
+#    - 用冻结 PINN 推理 a_hat
+#    - 构造补偿策略 observation
+#    - 再调用 residual policy 输出 u_comp
+#
+#    注意:
+#    这个类本身不是训练对象
+#    真正训练的是 self.residual_policy
+# ============================================================
+
+class FrozenBaseAndPinnResidualPolicy:
+    def __init__(
+        self,
+        base_policy,
+        residual_policy,
+        pinn_model,
+        pinn_mean: torch.Tensor,
+        pinn_std: torch.Tensor,
+        num_envs: int,
+        pinn_window_size: int,
+        device: str = "cuda",
+        disturbance_input: str = "pinn",
+    ):
+        self.base_policy = base_policy
+        self.residual_policy = residual_policy
+        self.pinn_model = pinn_model
+
+        self.pinn_mean = pinn_mean
+        self.pinn_std = pinn_std
+        self.disturbance_input = disturbance_input
+
+        self.num_envs = num_envs
+        self.pinn_window_size = pinn_window_size
+        self.device = device
+
+        # 为每个并行环境维护一个 PINN 滑动窗口
+        # PINN 滑动窗口（gt 模式下 pinn_mean=None，跳过构建）
+        if pinn_mean is not None:
+            self.pinn_feature_history = torch.zeros(
+                num_envs, pinn_window_size, pinn_mean.numel(), device=device
+            )
+        else:
+            self.pinn_feature_history = None
+        self.history_initialized = torch.zeros(num_envs, dtype=torch.bool, device=device)
+
+    @torch.no_grad()
+    def reset_history(self, env_ids: Optional[torch.Tensor] = None):
+        """
+        在环境 reset 时，把对应 env 的 PINN 历史窗口清掉。
+        如果 env_ids 为 None，就清空所有。
+        """
+        if self.pinn_feature_history is None:
+            # gt 模式下无 PINN 窗口，只重置 history flag
+            if env_ids is None:
+                self.history_initialized[:] = False
+            else:
+                self.history_initialized[env_ids] = False
+            return
+        if env_ids is None:
+            self.pinn_feature_history.zero_()
+            self.history_initialized[:] = False
+        else:
+            self.pinn_feature_history[env_ids] = 0.0
+            self.history_initialized[env_ids] = False
+
+    def _get_is_init_mask(self, td: TensorDictBase):
+        """
+        尝试从 tensordict 中读取 InitTracker 提供的 is_init 标记。
+        这个标记为 True 表示对应环境刚 reset。
+
+        不同版本下 key 的位置可能稍有差别，所以这里做兼容处理。
+        """
+        is_init = None
+
+        if "is_init" in td.keys():
+            is_init = td.get("is_init")
+        elif ("is_init",) in td.keys(True):
+            is_init = td.get(("is_init",))
+        elif ("next", "is_init") in td.keys(True):
+            is_init = td.get(("next", "is_init"))
+
+        if is_init is None:
+            return None
+
+        # 常见形状可能是 [N, 1] 或 [N]
+        while is_init.ndim > 1:
+            is_init = is_init.squeeze(-1)
+
+        return is_init.bool()
+
+    def _extract_base_obs_and_state(self, td: TensorDictBase):
+        """
+        从环境 info 中取出“冻结主策略原本需要的 observation/state”。
+
+        重要:
+        这要求 track_residual.py 额外在 info 中提供:
+            info["base_obs"]
+            info["base_state"]
+
+        否则我们没法把当前状态喂给原主策略。
+        """
+        info = td["info"]
+
+        if "base_obs" not in info.keys() or "base_state" not in info.keys():
+            raise KeyError(
+                "\n[ERROR] 当前 track_residual.py 还没有在 info 中提供 'base_obs' 和 'base_state'。\n"
+                "冻结主策略仍然需要吃它原来训练时的原始 Track observation/state。\n"
+                "请先在 track_residual.py 中补充:\n"
+                "  info['base_obs']   : [N, 1, obs_dim]\n"
+                "  info['base_state'] : [N, state_dim]\n"
+                "然后这份 train_residual.py 才能运行。\n"
+            )
+
+        base_obs = info["base_obs"]
+        base_state = info["base_state"]
+        return base_obs, base_state
+
+    def _build_base_policy_td(self, td: TensorDictBase):
+        """
+        构造给冻结主策略用的 tensordict。
+        """
+        base_obs, base_state = self._extract_base_obs_and_state(td)
+
+        base_td = TensorDict(
+            {
+                "agents": {
+                    "observation": base_obs,
+                    "state": base_state,
+                }
+            },
+            batch_size=td.batch_size,
+            device=self.device,
+        )
+        return base_td
+
+    def _build_current_pinn_feature(
+        self,
+        v_body: torch.Tensor,
+        w_body: torch.Tensor,
+        R_flat: torch.Tensor,
+        u_base: torch.Tensor,
+    ):
+        """
+        构造当前时刻 PINN 的单步输入特征:
+            [v_body(3), w_body(3), R_flat(9), u_base(4)] = 19
+        """
+        # u_base: [N, 1, 4] -> [N, 4]
+        u_base_flat = u_base.squeeze(1)
+
+        feat = torch.cat([v_body, w_body, R_flat, u_base_flat], dim=-1)
+        return feat  # [N, 19]
+
+    def _update_pinn_window(self, current_feat: torch.Tensor, is_init_mask: Optional[torch.Tensor]):
+        """
+        更新每个环境的 PINN 滑动窗口。
+        current_feat: [N, 19]
+
+        逻辑:
+        - 若某 env 刚 reset，则把整个窗口都填成当前特征
+        - 否则正常左移并 append 当前特征
+        """
+        num_envs = current_feat.shape[0]
+
+        # 第一次整体初始化
+        never_init_mask = ~self.history_initialized
+        if never_init_mask.any():
+            self.pinn_feature_history[never_init_mask] = current_feat[never_init_mask].unsqueeze(1).repeat(
+                1, self.pinn_window_size, 1
+            )
+            self.history_initialized[never_init_mask] = True
+
+        # 对刚 reset 的环境，重置滑动窗口
+        if is_init_mask is not None and is_init_mask.any():
+            self.pinn_feature_history[is_init_mask] = current_feat[is_init_mask].unsqueeze(1).repeat(
+                1, self.pinn_window_size, 1
+            )
+            self.history_initialized[is_init_mask] = True
+
+        # 对非 reset 环境，正常滑动
+        normal_mask = torch.ones(num_envs, dtype=torch.bool, device=self.device)
+        if is_init_mask is not None:
+            normal_mask = ~is_init_mask
+
+        if normal_mask.any():
+            self.pinn_feature_history[normal_mask, :-1] = self.pinn_feature_history[normal_mask, 1:].clone()
+            self.pinn_feature_history[normal_mask, -1] = current_feat[normal_mask]
+
+    def _predict_disturbance(
+        self,
+        current_feat: torch.Tensor,
+        is_init_mask: Optional[torch.Tensor],
+    ):
+        """
+        用冻结 PINN 做在线扰动估计。
+        返回:
+            a_hat: [N, 3]
+        """
+        self._update_pinn_window(current_feat, is_init_mask)
+
+        x_window = self.pinn_feature_history  # [N, W, 19]
+        x_window_norm = (x_window - self.pinn_mean.view(1, 1, -1)) / self.pinn_std.view(1, 1, -1)
+
+        a_hat = self.pinn_model(x_window_norm)  # [N, 3]
+        return a_hat
+
+    def _build_comp_obs(
+        self,
+        a_hat: torch.Tensor,
+        u_base: torch.Tensor,
+        v_body: torch.Tensor,
+        w_body: torch.Tensor,
+        R_flat: torch.Tensor,
+        rpos_body: torch.Tensor,
+        prev_rpos0_body: torch.Tensor,
+        vel_error_body: torch.Tensor,
+    ):
+        """
+        构造补偿策略 observation (改进版):
+            [a_hat(3), u_base(4), v_body(3), w_body(3), R_flat(9),
+             rpos_body(S*3), prev_rpos0_body(3), vel_error_body(3)]
+        rpos_body: [N, S, 3]，体坐标系下的未来S步轨迹误差
+        prev_rpos0_body: [N, 3]，体坐标系下的上一步位置误差
+        vel_error_body: [N, 3]，体坐标系下的速度误差
+        """
+        u_base_flat = u_base.squeeze(1)
+        rpos_flat = rpos_body.flatten(1)  # [N, S*3]
+        comp_obs = torch.cat([
+            a_hat, u_base_flat, v_body, w_body, R_flat,
+            rpos_flat, prev_rpos0_body, vel_error_body
+        ], dim=-1)
+        return comp_obs
+
+    @torch.no_grad()
+    def __call__(self, td: TensorDictBase, deterministic: bool = False):
+        """
+        collector / rollout 在每个时刻会调用这个函数。
+
+        步骤:
+        1. 用冻结主策略推理 u_base
+        2. 用冻结 PINN 推理 a_hat
+        3. 构造 residual policy 的 observation
+        4. 把 base_action / pred_disturbance 塞回 td["info"]
+        5. 调 residual_policy 输出 comp_action
+        """
+        # --------------------------------------------------------
+        # (1) 主策略推理
+        # --------------------------------------------------------
+        base_td = self._build_base_policy_td(td)
+        base_out = self.base_policy(base_td, deterministic=True)
+        u_base = torch.tanh(base_out[("agents", "action")]).detach()  # [N, 1, 4] CTBR [-1,1]
+
+        # --------------------------------------------------------
+        # (2) 从环境 info 里取 PINN / residual policy 所需原始量
+        # --------------------------------------------------------
+        info = td["info"]
+        v_body = info["v_body"]              # [N, 3]
+        w_body = info["w_body"]              # [N, 3]
+        R_flat = info["R_flat"]              # [N, 9]
+        rpos0 = info["rpos0"]                # [N, 3] 当前位置误差（用于PINN特征）
+        rpos_steps = info["rpos_steps"]       # [N, S, 3] 体坐标系下的未来S步轨迹误差
+        prev_rpos0 = info["prev_rpos0"]       # [N, 3] 体坐标系下的上一步位置误差
+        vel_error_body = info["vel_error_body"]  # [N, 3] 体坐标系下的速度误差
+
+        # --------------------------------------------------------
+        # (3) 扰动估计: pinn 模式走 PINN 推理，gt 模式直接读环境真值
+        # --------------------------------------------------------
+        is_init_mask = self._get_is_init_mask(td)
+        if self.disturbance_input == "gt":
+            # 直接从环境 info 读取 drag+wind 真值（机体系），跳过 PINN
+            a_hat = info["gt_disturbance"].detach()                    # [N, 3]
+        else:
+            # pinn 模式：维护滑窗并推理
+            current_feat = self._build_current_pinn_feature(v_body, w_body, R_flat, u_base)
+            a_hat = self._predict_disturbance(current_feat, is_init_mask)  # [N, 3]
+
+        # --------------------------------------------------------
+        # (4) 构造补偿策略 observation
+        # 体坐标系 rpos + prev_rpos0 + vel_error_body
+        # --------------------------------------------------------
+        comp_obs = self._build_comp_obs(
+            a_hat, u_base, v_body, w_body, R_flat,
+            rpos_steps, prev_rpos0, vel_error_body
+        )
+
+        # residual policy 使用的 observation/state
+        td[("agents", "observation")] = comp_obs.unsqueeze(1)  # [N, 1, 34]
+        td[("agents", "state")] = comp_obs                     # [N, 34]
+
+        # 环境执行 final action 时需要这些中间量
+        td[("info", "base_action")] = u_base
+        td[("info", "pred_disturbance")] = a_hat
+
+        # --------------------------------------------------------
+        # (5) 调 residual_policy
+        # --------------------------------------------------------
+        td_out = self.residual_policy(td, deterministic=deterministic)
+        return td_out
+
+
+# ============================================================
+# 6. 主流程
+# ============================================================
+
+@hydra.main(version_base=None, config_path=CONFIG_PATH, config_name="train_residual")
+def main(cfg):
+    """
+    这是 residual policy 的训练入口。
+
+    它和原 train.py 的主要区别在于：
+    - 环境使用 TrackResidual
+    - 训练的 policy 是 residual policy
+    - 同时加载冻结主策略和冻结 PINN
+    - 通过 FrozenBaseAndPinnResidualPolicy 完成在线编排
+    """
+    OmegaConf.register_new_resolver("eval", eval)
+    OmegaConf.resolve(cfg)
+    OmegaConf.set_struct(cfg, False)
+
+    simulation_app = init_simulation_app(cfg)
+    run = init_wandb(cfg)
+    setproctitle(run.name)
+    print(OmegaConf.to_yaml(cfg))
+
+    # --------------------------------------------------------
+    # 算法表
+    # --------------------------------------------------------
+    algos = {
+        "ppo": PPOPolicy,
+        "ppo_adaptive": PPOAdaptivePolicy,
+        "ppo_rnn": PPORNNPolicy,
+        "mappo": MAPPOPolicy,
+        "happo": HAPPOPolicy,
+        "qmix": QMIXPolicy,
+        "dqn": DQNPolicy,
+        "sac": SACPolicy,
+        "td3": TD3Policy,
+        "matd3": MATD3Policy,
+        "tdmpc": TDMPCPolicy,
+        "test": Policy,
+    }
+
+    from omni_drones.envs.isaac_env import IsaacEnv
+
+    # --------------------------------------------------------
+    # 创建 TrackResidual 环境
+    # --------------------------------------------------------
+    env_class = IsaacEnv.REGISTRY[cfg.task.name]
+    base_env = env_class(cfg, headless=cfg.headless)
+
+    transforms = [InitTracker()]
+
+    if cfg.task.get("flatten_obs", False):
+        transforms.append(ravel_composite(base_env.observation_spec, ("agents", "observation")))
+    if cfg.task.get("flatten_state", False):
+        transforms.append(ravel_composite(base_env.observation_spec, ("agents", "state")))
+    if (
+        cfg.task.get("flatten_intrinsics", True)
+        and ("agents", "intrinsics") in base_env.observation_spec.keys(True)
+    ):
+        transforms.append(ravel_composite(base_env.observation_spec, ("agents", "intrinsics"), start_dim=-1))
+
+    if cfg.task.get("history", False):
+        transforms.append(History([("agents", "observation")], steps=4))
+
+    # action transform 这里通常已经在环境最终动作接口层了
+    # residual policy 输出的是 residual CTBR，因此这里一般不再套额外 controller transform
+    action_transform: str = cfg.task.get("action_transform", None)
+    if action_transform is not None and str(action_transform).lower() != "none":
+        print(
+            f"[INFO] 当前 residual 环境下，action_transform={action_transform} 已在主策略接口层体现，"
+            f"这里默认不再额外追加 transforms。"
+        )
+
+    env = TransformedEnv(base_env, Compose(*transforms)).train()
+    env.set_seed(cfg.seed)
+
+    # --------------------------------------------------------
+    # 创建 residual policy（这是唯一需要训练的 policy）
+    # --------------------------------------------------------
+    residual_agent_spec: AgentSpec = env.agent_spec["drone"]
+    # 如果 yaml 指定了 residual_hidden_units，临时覆盖网络大小
+    _residual_hu = cfg.task.get("residual_hidden_units", None)
+    if _residual_hu is not None:
+        _residual_hu = list(_residual_hu)
+        with open_dict(cfg):
+            cfg.algo.actor.hidden_units = _residual_hu
+            cfg.algo.critic.hidden_units = _residual_hu
+    with open_dict(cfg):
+        cfg.algo.actor.tanh = True   # TanhNormal for residual only; restored after construction
+    residual_policy = algos[cfg.algo.name.lower()](cfg.algo, agent_spec=residual_agent_spec, device="cuda")
+    with open_dict(cfg):
+        cfg.algo.actor.tanh = False  # base_policy uses tanh=False to match its checkpoint
+    if _residual_hu is not None:
+        with open_dict(cfg):
+            del cfg.algo.actor.hidden_units
+            del cfg.algo.critic.hidden_units
+
+    print("===== Residual policy spec =====")
+    print(residual_agent_spec.observation_spec)
+    print(residual_agent_spec.action_spec)
+    print("================================")
+
+    # --------------------------------------------------------
+    # 创建冻结主策略
+    #
+    # 关键修复：
+    # 不再创建第二个 Track 环境。
+    # 直接使用 TrackResidual 环境内部已经构造好的：
+    #   - base_env.base_obs_dim
+    #   - base_env.base_state_dim
+    # 来手工构造主策略的虚拟 spec。
+    # --------------------------------------------------------
+    if not hasattr(base_env, "base_obs_dim") or not hasattr(base_env, "base_state_dim"):
+        raise RuntimeError(
+            "当前 TrackResidual 环境中没有 base_obs_dim / base_state_dim。\n"
+            "请确认 track_residual.py 的 _set_specs() 已正确设置这两个成员。"
+        )
+
+    base_obs_dim = int(base_env.base_obs_dim)
+    base_state_dim = int(base_env.base_state_dim)
+    base_action_dim = 4
+
+    print("===== Base policy virtual spec dims =====")
+    print("base_obs_dim:", base_obs_dim)
+    print("base_state_dim:", base_state_dim)
+    print("base_action_dim:", base_action_dim)
+    print("=========================================")
+
+    base_agent_spec = build_virtual_base_agent_spec(
+        num_envs=env.num_envs,
+        obs_dim=base_obs_dim,
+        state_dim=base_state_dim,
+        action_dim=base_action_dim,
+        device="cuda",
+    )
+
+    print(base_agent_spec._env.observation_spec["agents"]["observation"])
+    print(base_agent_spec._env.action_spec["agents"]["action"])
+
+    # base policy 与 residual policy 共用默认 [256,256,256]
+    base_policy = algos[cfg.algo.name.lower()](cfg.algo, agent_spec=base_agent_spec, device="cuda")
+
+    if cfg.task.get("base_model_dir", None) is None:
+        raise ValueError("cfg.task.base_model_dir 不能为空，需要提供冻结主策略 checkpoint 路径。")
+
+    print(f"[INFO] Loading frozen base policy from: {cfg.task.base_model_dir}")
+    base_policy.load_state_dict(torch.load(cfg.task.base_model_dir, map_location="cuda"))
+
+    # MAPPOPolicy 本身通常没有 eval()，需要对子模块单独设为 eval
+    if hasattr(base_policy, "actor"):
+        base_policy.actor.eval()
+    if hasattr(base_policy, "critic"):
+        base_policy.critic.eval()
+
+    # 冻结参数
+    if hasattr(base_policy, "actor"):
+        for p in base_policy.actor.parameters():
+            p.requires_grad = False
+    if hasattr(base_policy, "critic"):
+        for p in base_policy.critic.parameters():
+            p.requires_grad = False
+
+    # --------------------------------------------------------
+    # 创建冻结 PINN
+    # --------------------------------------------------------
+    _disturbance_input = str(cfg.task.get("disturbance_input", "pinn")).lower()
+    # gt 模式下自动启用 expose_gt_disturbance（覆盖 yaml 默认 false）
+    if _disturbance_input == "gt":
+        with open_dict(cfg):
+            cfg.task.expose_gt_disturbance = True
+
+    if _disturbance_input == "pinn" and cfg.task.get("pinn_model_dir", None) is None:
+        raise ValueError("cfg.task.pinn_model_dir 不能为空，需要提供 PINN checkpoint 路径。")
+
+    if _disturbance_input == "gt":
+        # gt 模式：不需要 PINN，置 None，composed_policy 会走 gt 分支
+        pinn_model = None
+        pinn_mean = None
+        pinn_std = None
+        print("[INFO] disturbance_input=gt: skipping PINN load, using ground-truth disturbance.")
+    else:
+        pinn_model = PI_WAN(
+            input_dim=int(cfg.task.pinn_input_dim),
+            output_dim=int(cfg.task.pinn_output_dim),
+            hidden_dim=int(cfg.task.pinn_hidden_dim),
+        ).to("cuda")
+
+        print(f"[INFO] Loading frozen PINN from: {cfg.task.pinn_model_dir}")
+        pinn_model.load_state_dict(torch.load(cfg.task.pinn_model_dir, map_location="cuda"))
+        pinn_model.eval()
+        for p in pinn_model.parameters():
+            p.requires_grad = False
+
+        # --------------------------------------------------------
+        # 读取 PINN 归一化统计量
+        # --------------------------------------------------------
+        if cfg.task.get("pinn_stats_dataset", None) is None:
+            raise ValueError(
+                "cfg.task.pinn_stats_dataset 不能为空。\n"
+                "因为你当前 PINN 推理需要从训练数据集重新计算 mean/std。"
+            )
+
+        pinn_mean, pinn_std = load_pinn_stats_from_dataset(
+            data_path=cfg.task.pinn_stats_dataset,
+            train_ratio=float(cfg.task.get("pinn_train_ratio", 0.9)),
+            device="cuda",
+        )
+
+    # --------------------------------------------------------
+    # 构造“冻结主策略 + 冻结 PINN + 可训练 residual policy”编排器
+    # --------------------------------------------------------
+    composed_policy = FrozenBaseAndPinnResidualPolicy(
+        base_policy=base_policy,
+        residual_policy=residual_policy,
+        pinn_model=pinn_model,
+        pinn_mean=pinn_mean,
+        pinn_std=pinn_std,
+        num_envs=env.num_envs,
+        pinn_window_size=int(cfg.task.pinn_window_size),
+        device="cuda",
+        disturbance_input=_disturbance_input,
+    )
+
+    # --------------------------------------------------------
+    # collector
+    # 重要:
+    # collector 调用的是 composed_policy
+    # 但 train_op 训练的是 residual_policy
+    # --------------------------------------------------------
+    frames_per_batch = env.num_envs * int(cfg.algo.train_every)
+    total_frames = cfg.get("total_frames", -1) // frames_per_batch * frames_per_batch
+    max_iters = cfg.get("max_iters", -1)
+    eval_interval = cfg.get("eval_interval", -1)
+    save_interval = cfg.get("save_interval", -1)
+
+    stats_keys = [
+        k for k in base_env.observation_spec.keys(True, True)
+        if isinstance(k, tuple) and k[0] == "stats"
+    ]
+    episode_stats = EpisodeStats(stats_keys)
+
+    collector = SyncDataCollector(
+        env,
+        policy=composed_policy,
+        frames_per_batch=frames_per_batch,
+        total_frames=total_frames,
+        device=cfg.sim.device,
+        return_same_td=True,
+    )
+
+    # --------------------------------------------------------
+    # 评估函数
+    # 这里评估的是“base + PINN + residual policy”的整体闭环效果
+    # --------------------------------------------------------
+    @torch.no_grad()
+    def evaluate(seed: int = 0):
+        frames = []
+
+        base_env.enable_render(True)
+        base_env.eval()
+        env.eval()
+        env.set_seed(seed)
+
+        composed_policy.reset_history()
+
+        tbar = tqdm(total=base_env.max_episode_length)
+
+        def record_frame(*args, **kwargs):
+            frame = env.base_env.render(mode="rgb_array")
+            frames.append(frame)
+            tbar.update(2)
+
+        trajs = env.rollout(
+            max_steps=base_env.max_episode_length,
+            policy=lambda x: composed_policy(x, deterministic=True),
+            callback=Every(record_frame, 2),
+            auto_reset=True,
+            break_when_any_done=False,
+            return_contiguous=False,
+        ).clone()
+
+        base_env.enable_render(not cfg.headless)
+        env.reset()
+
+        done = trajs.get(("next", "done"))
+        first_done = torch.argmax(done.long(), dim=1).cpu()
+
+        def take_first_episode(tensor: torch.Tensor):
+            indices = first_done.reshape(first_done.shape + (1,) * (tensor.ndim - 2))
+            return torch.take_along_dim(tensor, indices, dim=1).reshape(-1)
+
+        traj_stats = {
+            k: take_first_episode(v)
+            for k, v in trajs[("next", "stats")].cpu().items()
+        }
+
+        info = {
+            "eval/stats." + k: torch.nanmean(v.float()).item()
+            for k, v in traj_stats.items()
+        }
+
+        if len(frames):
+            video_array = np.stack(frames).transpose(0, 3, 1, 2)
+            frames.clear()
+            info["recording"] = wandb.Video(video_array, fps=0.5 / cfg.sim.dt, format="mp4")
+
+        return info
+
+    # --------------------------------------------------------
+    # 训练循环
+    # --------------------------------------------------------
+    pbar = tqdm(collector)
+    env.train()
+
+    for i, data in enumerate(pbar):
+        base_env.count = i
+        info = {"env_frames": collector._frames, "rollout_fps": collector._fps}
+
+        episode_stats(data.to_tensordict())
+
+        if len(episode_stats) >= base_env.num_envs:
+            stats = {
+                "train/" + (".".join(k) if isinstance(k, tuple) else k): torch.mean(v).item()
+                for k, v in episode_stats.pop().items(True, True)
+            }
+            info.update(stats)
+
+        # entropy coefficient linear annealing
+        if total_frames > 0 and hasattr(residual_policy, 'cfg'):
+            progress = min(collector._frames / total_frames, 1.0)
+            entropy_init = cfg.algo.entropy_coef
+            entropy_final = cfg.algo.get("entropy_coef_final", entropy_init)
+            residual_policy.cfg.entropy_coef = entropy_init + (entropy_final - entropy_init) * progress
+
+        # 这里只训练 residual_policy
+        info.update(residual_policy.train_op(data.to_tensordict()))
+
+        if eval_interval > 0 and i % eval_interval == 0:
+            logging.info(f"Eval at {collector._frames} steps.")
+            info.update(evaluate())
+            env.train()
+
+        if save_interval > 0 and i % save_interval == 0:
+            if hasattr(residual_policy, "state_dict"):
+                ckpt_path = os.path.join(run.dir, f"checkpoint_{collector._frames}.pt")
+                logging.info(f"Save checkpoint to {str(ckpt_path)}")
+                torch.save(residual_policy.state_dict(), ckpt_path)
+
+        run.log(info)
+
+        printable_info = {k: v for k, v in info.items() if isinstance(v, float)}
+        print(OmegaConf.to_yaml(printable_info))
+
+        pbar.set_postfix({
+            "rollout_fps": collector._fps,
+            "frames": collector._frames,
+        })
+
+        if max_iters > 0 and i >= max_iters - 1:
+            break
+
+    # --------------------------------------------------------
+    # 训练结束，最终评估并保存 residual policy
+    # --------------------------------------------------------
+    logging.info(f"Final Eval at {collector._frames} steps.")
+    info = {"env_frames": collector._frames}
+    info.update(evaluate())
+    run.log(info)
+
+    if hasattr(residual_policy, "state_dict"):
+        ckpt_path = os.path.join(run.dir, "checkpoint_final.pt")
+        logging.info(f"Save residual checkpoint to {str(ckpt_path)}")
+        torch.save(residual_policy.state_dict(), ckpt_path)
+
+    wandb.save(os.path.join(run.dir, "checkpoint*"))
+    wandb.finish()
+
+    simulation_app.close()
+
+
+if __name__ == "__main__":
+    main()

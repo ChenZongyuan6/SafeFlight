@@ -1,0 +1,259 @@
+"""
+Offline evaluation of the L1 disturbance observer as a baseline.
+
+Dataset format (from collect_data.py / "next" key):
+    inputs  [Envs, T, 19]:
+        [:, t, 0:3]   = v_body at step t+1
+        [:, t, 3:6]   = w_body at step t+1
+        [:, t, 6:15]  = R_flat at step t+1;  R_flat.reshape(3,3) = R_bw^T
+        [:, t, 15:18] = rpy action at step t
+        [:, t, 18]    = target_thrust (CTBR) at step t, range [-1, 1]
+                         映射到控制器: (x+1)/2 * 15.0  m/s²
+                         (来自 PIDrate_FM 的硬编码上限，见 lee_position_controller.py)
+    labels  [Envs, T, 3]:
+        gt_disturbance in body frame at step t+1, units m/s²
+
+Thrust alignment note:
+    inputs[t] gives state at t+1 and action u(t).
+    To propagate the predictor from v(t+1) to v(t+2) we need u(t+1) = inputs[t+1, 18].
+    So in the loop, thrust comes from inputs[t+1] (next step).
+
+Usage:
+    Edit the paths/hyperparameters below, then run:
+        python eval_l1_baseline.py
+"""
+
+import sys
+import os
+import math
+from datetime import datetime
+import numpy as np
+import torch
+import matplotlib.pyplot as plt
+
+sys.path.insert(0, os.path.dirname(__file__))
+from l1_observer import L1AccelerationObserver
+
+# ===========================================================================
+# Configuration  —  edit these before running
+# ===========================================================================
+
+TRAIN_DATA_PATH = "collected_data/dataset_20260505_0156/dataset_train_20260505_0156.pt"
+TEST_DATA_PATH  = "collected_data/dataset_20260506_0322/dataset_test_20260506_0322.pt"
+
+START_ENV_IDX   = 0
+END_ENV_IDX     = 10
+
+# Physical constants (must match data collection)
+DT          = 0.02
+MASS        = 0.93
+MAX_THRUST  = 38.0086
+GRAVITY     = (0.0, 0.0, -9.81)
+
+# L1 hyperparameters
+AS_VALUE    = -0.01   # L1 bandwidth; aligned with DATT (adaptation_module.py: self.A = -0.01)
+ALPHA       = 0.99    # EMA smoothing; aligned with DATT (adaptation_module.py: alpha = 0.99)
+CLIP_VALUE  = 5.0
+
+BASE_SAVE_DIR = "/root/SimpleFlight/scripts/l1_test_output"
+
+# ===========================================================================
+
+def decode_state(inputs_t: torch.Tensor, device: str):
+    """
+    Extract world-frame velocity and R_bw from one time-slice [N, 19].
+    Returns: v_world [N,3], R_bw [N,3,3]
+    """
+    N = inputs_t.shape[0]
+    v_body = inputs_t[:, 0:3]
+    R_flat = inputs_t[:, 6:15]
+    # R_flat rows = [heading, lateral, up] = columns of R_bw → R_flat = R_bw^T
+    R_bw = R_flat.reshape(N, 3, 3).transpose(-1, -2)  # [N, 3, 3]
+    v_world = torch.bmm(R_bw, v_body.unsqueeze(-1)).squeeze(-1)
+    return v_world, R_bw
+
+
+def decode_thrust(inputs_t: torch.Tensor):
+    """
+    Extract mass-normalised thrust acceleration from one time-slice [N, 19].
+
+    inputs[:, 18] = target_thrust ∈ [-1, 1]，由 PIDRateController_flightmare 存入。
+    控制器内部映射: target_thrust_cmd = (x + 1) / 2 * 15.0  [m/s²]
+    15.0 是 PIDrate_FM 的硬编码推力上限（lee_position_controller.py 第 509 行）。
+    注意：此值已是质量归一化加速度，无需再除 MASS。
+    """
+    throttle = inputs_t[:, 18]
+    return (throttle + 1.0) / 2.0 * 15.0  # [m/s²]，与 PIDrate_FM 控制器对齐
+
+
+def evaluate_single_config(
+    inputs: torch.Tensor,
+    labels: torch.Tensor,
+    env_indices: list,
+    As_value: float,
+    alpha: float,
+    clip_value: float,
+    save_dir: str,
+    device: str,
+    tag: str = "",
+):
+    N   = len(env_indices)
+    T   = inputs.shape[1]
+
+    inp = inputs[env_indices]   # [N, T, 19]
+    lbl = labels[env_indices]   # [N, T, 3]
+
+    # Initialise observer: vel_hat = v(1) = state at inputs[0]
+    v0_world, _ = decode_state(inp[:, 0, :], device)
+    observer = L1AccelerationObserver(
+        num_envs=N, dt=DT, gravity=GRAVITY,
+        As_value=As_value, alpha=alpha, clip_value=clip_value, device=device,
+    )
+    observer.reset(v_world=v0_world)
+
+    preds_all = torch.zeros(N, T, 3, device=device)
+
+    for t in range(T):
+        v_world, R_bw = decode_state(inp[:, t, :], device)
+        # Thrust to propagate from v(t+1) toward v(t+2): use action at t+1
+        # At last step, reuse current action (predictor output not used for comparison)
+        t_next = min(t + 1, T - 1)
+        thrust_acc = decode_thrust(inp[:, t_next, :])
+
+        a_hat_world = observer.step(v_world, R_bw, thrust_acc)
+        a_hat_body  = L1AccelerationObserver.world_to_body(a_hat_world, R_bw)
+        preds_all[:, t, :] = a_hat_body
+
+    preds_np = preds_all.cpu().numpy()
+    gts_np   = lbl.cpu().numpy()
+
+    os.makedirs(save_dir, exist_ok=True)
+    all_rmse = []
+
+    for i, env_idx in enumerate(env_indices):
+        pred = preds_np[i]
+        gt   = gts_np[i]
+
+        rmse_x  = math.sqrt(float(np.mean((gt[:, 0] - pred[:, 0]) ** 2)))
+        rmse_y  = math.sqrt(float(np.mean((gt[:, 1] - pred[:, 1]) ** 2)))
+        rmse_z  = math.sqrt(float(np.mean((gt[:, 2] - pred[:, 2]) ** 2)))
+        rmse_3d = math.sqrt(float(np.mean(np.sum((pred - gt) ** 2, axis=1))))
+        all_rmse.append({"env": env_idx, "x": rmse_x, "y": rmse_y, "z": rmse_z, "3d": rmse_3d})
+
+        time_axis  = np.arange(T) * DT
+        axis_names = ["X", "Y", "Z"]
+        rmse_vals  = [rmse_x, rmse_y, rmse_z]
+
+        fig, axs = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
+        for ax_i in range(3):
+            axs[ax_i].plot(time_axis, gt[:, ax_i],   label="Ground Truth", color="black",
+                           linewidth=1.5, linestyle="--")
+            axs[ax_i].plot(time_axis, pred[:, ax_i], label="L1 Estimate",  color="blue",
+                           linewidth=1.5, alpha=0.8)
+            axs[ax_i].set_ylabel(f"Disturbance {axis_names[ax_i]} (m/s²)")
+            axs[ax_i].legend(loc="upper right")
+            axs[ax_i].grid(True, linestyle=":", alpha=0.6)
+            axs[ax_i].set_title(f"Axis {axis_names[ax_i]}  RMSE: {rmse_vals[ax_i]:.4f} m/s²")
+        axs[-1].set_xlabel("Time (s)")
+        plt.suptitle(
+            f"Env {env_idx}  —  L1 Observer  (As={As_value}, alpha={alpha})\n"
+            f"RMSE  X: {rmse_x:.4f}   Y: {rmse_y:.4f}   Z: {rmse_z:.4f}"
+            f"   3D: {rmse_3d:.4f}  m/s²",
+            fontsize=13,
+        )
+        plt.tight_layout()
+        fig_name = f"L1_env{env_idx}{tag}.png"
+        plt.savefig(os.path.join(save_dir, fig_name), dpi=150)
+        plt.close(fig)
+        print(f"  [Env {env_idx}]  X={rmse_x:.4f}  Y={rmse_y:.4f}  Z={rmse_z:.4f}"
+              f"  3D={rmse_3d:.4f}  → {fig_name}")
+
+    return all_rmse
+
+
+def print_summary(all_rmse: list, header: str, save_path: str):
+    mean_x  = np.mean([r["x"]  for r in all_rmse])
+    mean_y  = np.mean([r["y"]  for r in all_rmse])
+    mean_z  = np.mean([r["z"]  for r in all_rmse])
+    mean_3d = np.mean([r["3d"] for r in all_rmse])
+
+    sep = "-" * 56
+    lines = [
+        f"=== {header} ===",
+        f"Test data : {TEST_DATA_PATH}",
+        f"Env range : [{all_rmse[0]['env']}, {all_rmse[-1]['env']}]",
+        "",
+        f"{'Env':>5}  {'RMSE_X':>10}  {'RMSE_Y':>10}  {'RMSE_Z':>10}  {'RMSE_3D':>10}",
+        sep,
+    ]
+    for r in all_rmse:
+        lines.append(
+            f"{r['env']:>5}  {r['x']:>10.4f}  {r['y']:>10.4f}"
+            f"  {r['z']:>10.4f}  {r['3d']:>10.4f}"
+        )
+    lines += [
+        sep,
+        f"{'Mean':>5}  {mean_x:>10.4f}  {mean_y:>10.4f}"
+        f"  {mean_z:>10.4f}  {mean_3d:>10.4f}",
+        "",
+        "(All RMSE in m/s²)",
+    ]
+    text = "\n".join(lines)
+    print("\n" + text)
+    with open(save_path, "w") as f:
+        f.write(text)
+    print(f"Summary saved to: {save_path}")
+
+
+def main():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Device: {device}")
+    print(f"L1 config: As={AS_VALUE}, alpha={ALPHA}, clip={CLIP_VALUE}")
+
+    print(f"\nLoading: {TEST_DATA_PATH}")
+    data        = torch.load(TEST_DATA_PATH)
+    inputs_all  = data["inputs"].float().to(device)
+    labels_all  = data["labels"].float().to(device)
+    E, T, _     = inputs_all.shape
+    print(f"Dataset shape: inputs={tuple(inputs_all.shape)}, labels={tuple(labels_all.shape)}")
+
+    env_indices = list(range(min(START_ENV_IDX, E - 1), min(END_ENV_IDX + 1, E)))
+    print(f"Evaluating envs: {env_indices[0]} … {env_indices[-1]}  ({len(env_indices)} trajectories)")
+
+    run_ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
+    SAVE_DIR = os.path.join(BASE_SAVE_DIR, run_ts)
+    os.makedirs(SAVE_DIR, exist_ok=True)
+    print(f"Results will be saved to: {SAVE_DIR}")
+
+    print(f"\n--- Evaluating L1 observer ---")
+    all_rmse = evaluate_single_config(
+        inputs_all, labels_all, env_indices,
+        AS_VALUE, ALPHA, CLIP_VALUE, SAVE_DIR, device,
+    )
+    summary_path = os.path.join(
+        SAVE_DIR,
+        f"eval_summary_env{env_indices[0]}to{env_indices[-1]}.txt",
+    )
+    print_summary(all_rmse, "L1 Observer Evaluation Summary", summary_path)
+
+    # --- Hyperparameter sweep (uncomment to enable) ---
+    # sweep_configs = [
+    #     {"As_value": -5.0,  "alpha": 0.90},
+    #     {"As_value": -10.0, "alpha": 0.90},
+    #     {"As_value": -20.0, "alpha": 0.90},
+    #     {"As_value": -10.0, "alpha": 0.80},
+    #     {"As_value": -10.0, "alpha": 0.95},
+    # ]
+    # for cfg in sweep_configs:
+    #     tag = f"_As{cfg['As_value']}_a{cfg['alpha']}"
+    #     print(f"\n--- Sweep: {cfg} ---")
+    #     rmse = evaluate_single_config(
+    #         inputs_all, labels_all, env_indices,
+    #         cfg["As_value"], cfg["alpha"], CLIP_VALUE,
+    #         SAVE_DIR, device, tag=tag,
+    #     )
+    #     print(f"  Mean 3D RMSE: {np.mean([r['3d'] for r in rmse]):.4f} m/s²")
+
+
+if __name__ == "__main__":
+    main()

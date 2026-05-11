@@ -1,0 +1,197 @@
+name: TrackResidual
+
+defaults:
+  - /base/env_base@_here_
+  - /base/sim_base@_here_
+
+env:
+  num_envs: 4096
+  max_episode_length: 1000
+
+drone_model: Air
+force_sensor: false
+time_encoding: false
+wind: true
+latency: false
+latency_step: 1
+random_latency: true
+
+reset_thres: 1.0
+eval_no_reset: true   # true: eval 时禁用 distance>reset_thres 的提前 reset，使 episode 跑满 max_episode_length
+future_traj_steps: 10
+time_encoding_dim: 4
+
+use_eval: true     #true
+eval_traj: "normal"   # poly, zigzag, pentagram, slow, normal, fast
+use_rotor2critic: 0
+use_action_history: false
+action_history_step: 5
+use_ab_wolrd_pos: false
+
+# reward weights
+reward_up_weight: 1.0
+reward_spin_weight: 1.0
+
+reward_acc_weight_init: 0.0
+reward_acc_weight_lr: 0.0005
+reward_acc_max: 0.0
+
+reward_jerk_weight_init: 0.0
+reward_jerk_weight_lr: 0.0005
+reward_jerk_max: 0.0
+
+reward_snap_weight_init: 0.0
+reward_snap_weight_lr: 0.0005
+reward_snap_max: 0.0
+
+reward_action_smoothness_weight_init: 0.0
+reward_action_smoothness_weight_lr: 0.0
+reward_smoothness_max: 0.0
+
+# reward_action_smoothness_weight_init: 2.0
+# reward_action_smoothness_weight_lr: 0.0005
+# reward_smoothness_max: 2.0
+
+reward_action_norm_weight_init: 0.0
+reward_action_norm_weight_lr: 0.0001
+reward_norm_max: 0.0
+
+reward_distance_scale: 5.0
+
+action_transform: PIDrate_FM
+
+flatten_obs: false
+flatten_state: false
+
+# =========================
+# residual policy settings
+# =========================
+residual_alpha: 0.7
+
+# 残差策略网络大小，null 表示使用 mappo.yaml 默认值（[256,256,256]）
+# 例：residual_hidden_units: [128, 128]
+residual_hidden_units: null
+
+# residual regularization in reward
+residual_penalty_coef: 0.0
+residual_smoothness_coef: 0.002
+
+# residual CTBR clipping
+# comp_action = [Δc, Δp, Δq, Δr]
+delta_c_limit: 0.4
+delta_rate_limit: 0.5
+
+# =========================
+# frozen base policy path
+# train_residual.py 里会读取
+# =========================
+base_model_dir: /root/SimpleFlight/scripts/outputs/track_None/12-15_01-22/wandb/latest-run/files/checkpoint_final.pt
+#/root/SimpleFlight/scripts/outputs/track_None/01-07_23-25/wandb/latest-run/files/checkpoint_final.pt #这个是加利普希斯约束最好的base model
+#/root/SimpleFlight/scripts/outputs/track_None/12-15_01-22/wandb/latest-run/files/checkpoint_final.pt #这个是不加利普希斯约束最好的base model
+
+# =========================
+# frozen PINN path
+# train_residual.py 里会读取
+# =========================
+pinn_model_dir: /root/SimpleFlight/scripts/pinncheckpoint/03_20_04_00/best_pi_wan_model.pth
+
+pinn_stats_dataset: /root/SimpleFlight/scripts/collected_data/dataset_20260316_0028/dataset_20260316_0028.pt
+#/你的PINN训练数据集路径/dataset_xxx.pt
+pinn_train_ratio: 0.9
+# =========================
+# PINN structure / inference settings
+# 第一版按你现在已训练好的那版
+# input = [v_body(3), w_body(3), R_flat(9), u_base(4)] = 19
+# output = disturbance accel in body frame (3)
+# =========================
+pinn_input_dim: 19
+pinn_output_dim: 3
+pinn_hidden_dim: 64
+pinn_window_size: 5
+
+# 可先固定，后面 train_residual.py 里再按需要扩展
+comp_obs_use_rpos: true
+comp_obs_use_rot: true  # R_flat(9) 已加入obs，维度22->31
+comp_obs_use_prev_comp: false
+
+# 补偿策略轨迹预见步数（rpos 步数），默认6
+comp_rpos_steps: 6
+
+# 如果后面想开 drone randomization，可以取消注释
+# randomization:
+#   drone:
+#     train:
+#       mass_scale: [0.9, 1.1]
+#       inertia_scale: [0.9, 1.1]
+#       drag_coef_scale: [0.9, 1.1]
+#       tau_scale: [0.9, 1.1]
+# =========================
+# disturbance input mode
+# =========================
+# "pinn": use frozen PINN to estimate disturbance (default, production mode)
+# "gt"  : use ground-truth disturbance (drag+wind) for upper-bound test
+disturbance_input: "gt"   # 切换到GT真值上限测试
+# disturbance_input: "pinn"  # 切换回生产PINN模式
+
+# expose_gt_disturbance: must be true when disturbance_input="gt"
+# NOTE: env 在构造时读取此值，auto-set 代码在 env 创建之后执行（无效）。
+expose_gt_disturbance: false
+
+# ================================================================
+# [2026-05-06 重构] 扰动模型配置
+# wind: true/false 为总开关；disturbance.mode 决定类型，enable 参数已移除
+# wind: true  (不写 disturbance 块) → sinsum（向后兼容）
+# wind: true  + disturbance.mode: "composite" → 三维复合扰动（当前配置）
+# ================================================================
+disturbance:
+  mode: "sinsum"        # "sinsum"（默认，向后兼容）| "composite"
+
+  # 仅应用水平（x-y）扰动，z方向为0。建议值：true
+  horizontal_only: false
+
+  # 将所有分量求和后的总水平扰动范数进行截断
+  clip_total: false  # 不再对总扰动限幅
+  max_total_acc_train: 3.0   # m/s^2
+  max_total_acc_eval:  3.5   # m/s^2
+
+  # ============================================================
+  # [mode: sinsum] 原有的多频率正弦叠加参数
+  # a(t) = intensity * sum_j sin(w_j * t),  w_j ~ N(0,1)
+  # ============================================================
+  sinsum:
+    intensity_range: [0.0, 2.0]   # 每个环境的随机强度标量
+    num_freqs: 8                  # 每个轴的频率分量数量
+
+  # ============================================================
+  # [mode: composite] 新型三分量模型
+  # a_dist = clip_xy(a_bias + a_gm + a_swing, max_total_acc)
+  # ============================================================
+
+  # 分量 1：常值偏置
+  # A_bias_xyz 各轴独立 U(range[0], range[1])，单位 m/s^2
+  # 方向：[0, 2*pi] 内的均匀随机角度
+  bias:
+    enable: true
+    range_train: [-2.0, 2.0]   # m/s^2，每轴独立均匀采样
+    range_eval:  [-2.0, 2.0]   # m/s^2，与训练相同
+
+  # 分量 2：Gauss-Markov随机扰动
+  # a_gm[k+1] = alpha * a_gm[k] + sigma * sqrt(1-alpha^2) * eps
+  # alpha = exp(-dt / tau)
+  gauss_markov:
+    enable: true
+    sigma_range_train: [0.2, 0.8]   # m/s^2，稳态标准差
+    sigma_range_eval:  [0.2, 0.8]   # m/s^2，与训练相同
+    tau_range: [0.5, 2.0]           # 秒，相关时间
+    reset_to_zero: true             # episode开始时初始化 a_gm=0
+
+  # 分量 3：摆动正弦（悬挂负载钟摆模型）
+  # a_swing_xy(t) = A_xy * sin(2*pi*f_s*t + phi_xy)
+  # A_x, A_y ~ U(0, amp_range[1]) 独立采样
+  # f_s ~ U(freq_range[0], freq_range[1])
+  swing:
+    enable: true
+    amp_range_train: [0.0, 0.5]    # m/s^2，每轴的幅值
+    amp_range_eval:  [0.0, 0.5]    # m/s^2，与训练相同
+    freq_range: [0.3, 1.2]         # Hz，类似钟摆的频率范围
+    random_phase: true             # phi ~ U(0, 2*pi)，避免t=0时风力为0

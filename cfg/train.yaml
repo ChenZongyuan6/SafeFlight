@@ -7,6 +7,8 @@ sim: ${task.sim}
 env: ${task.env}
 
 model_dir: null
+#/root/SimpleFlight/scripts/outputs/track_None/12-15_01-22/wandb/latest-run/files/checkpoint_final.pt
+#/root/SimpleFlight/scripts/outputs/track_None/12-15_01-22/wandb/latest-run/files/checkpoint_final.pt
 #/root/SimpleFlight/scripts/outputs/hover/02-05_11-44/wandb/latest-run/files/checkpoint_final.pt
 #/root/SimpleFlight/scripts/outputs/track_None/12-15_01-22/wandb/latest-run/files/checkpoint_final.pt
 #/root/SimpleFlight/scripts/outputs/track_None/01-08_15-49/wandb/latest-run/files/checkpoint_final.pt
@@ -19,7 +21,7 @@ total_frames: 9000_000_000 #1000_000_000
 max_iters: -1
 eval_interval: -1
 save_interval: 100
-seed: 42           #original simpleflight：0
+seed: 0                 #20260316前采集数据42           #original simpleflight：0
 
 viewer:
   resolution: [960, 720]
@@ -31,7 +33,7 @@ viewer:
 
 wandb:
   group: ${oc.select:..task.name}
-  run_name: hover  #track
+  run_name: track_distur  #hover  #track 
   #_Li${algo.actor.jacobian_coef}
   # run_name: debug
   job_type: train
@@ -44,7 +46,7 @@ wandb:
   tags: 
 
 defaults:
-  - task: Hover
+  - task: Track #决定读哪份 yaml 文件 track和有扰动的环境采集trackpinn都调用公用Track.yaml所以都用这个
   # - task: Hover Track
   - algo: mappo
   - _self_

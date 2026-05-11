@@ -1,0 +1,127 @@
+import torch
+import matplotlib
+# 强制使用无头后端，防止 SSH 报错
+matplotlib.use('Agg') 
+import matplotlib.pyplot as plt
+import numpy as np
+import os
+
+# ==========================================
+# 配置参数
+# ==========================================
+
+DATA_FILE = "collected_data/dataset_20260505_0156/dataset_test_20260505_0156.pt"  # 替换为你的实际文件路径
+#collected_data/dataset_20260316_1153/dataset_test_20260316_1153.pt
+#/root/SimpleFlight/scripts/collected_data/dataset_20260505_0156/dataset_test_20260505_0156.pt
+ENV_INDEX_TO_PLOT = 3     # 选择可视化的环境序号 (1 到 4096)
+DT = 0.02                 # 仿真步长 (50Hz = 0.02s)
+
+# 删除中文字体设置，仅保留负号正常显示
+plt.rcParams['axes.unicode_minus'] = False
+
+def visualize_trajectory():
+    # ... (前面的数据读取代码保持完全不变) ...
+    if not os.path.exists(DATA_FILE):
+        print(f"File not found: {DATA_FILE}")
+        return
+        
+    data = torch.load(DATA_FILE)
+    inputs = data["inputs"].numpy()  
+    labels = data["labels"].numpy()  
+ 
+    num_envs, time_steps, _ = inputs.shape
+    
+    env_idx = ENV_INDEX_TO_PLOT - 1
+    if env_idx < 0 or env_idx >= num_envs:
+        env_idx = 0
+        
+    env_inputs = inputs[env_idx] 
+    env_labels = labels[env_idx] 
+    
+    time_axis = np.arange(time_steps) * DT
+    
+    v_body = env_inputs[:, 0:3]       
+    w_body = env_inputs[:, 12:15]     
+    cmd_thrust = env_inputs[:, 15]    
+    cmd_br = env_inputs[:, 16:19]     
+    dist_acc = env_labels[:, 0:3]     
+
+    # ==========================================
+    # 开始绘图 (全英文)
+    # ==========================================
+    # save_dir = f"collected_data/plot_results/env_{env_idx + 1}"
+    # os.makedirs(save_dir, exist_ok=True)
+        # ==========================================
+    # 获取 pt 文件的目录路径
+    # ==========================================
+    pt_file_dir = os.path.dirname(DATA_FILE)
+
+    # ==========================================
+    # 开始绘图 (全英文)
+    # ==========================================
+    save_dir = os.path.join(pt_file_dir, f"plot_results/env_{env_idx + 1}")
+    os.makedirs(save_dir, exist_ok=True)
+
+    # [图1]
+    fig1 = plt.figure(figsize=(10, 5))
+    plt.plot(time_axis, v_body[:, 0], label='v_x (Forward)', color='r')
+    plt.plot(time_axis, v_body[:, 1], label='v_y (Left)', color='g')
+    plt.plot(time_axis, v_body[:, 2], label='v_z (Up)', color='b')
+    plt.title(f"Fig 1: Env {env_idx+1} - Body Linear Velocity (v_body)")
+    plt.xlabel("Time (s)")
+    plt.ylabel("Velocity (m/s)")
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.legend()
+    fig1.savefig(os.path.join(save_dir, "1_v_body.png"), dpi=200, bbox_inches='tight')
+
+    # [图2]
+    fig2 = plt.figure(figsize=(10, 5))
+    plt.plot(time_axis, w_body[:, 0], label='w_x (Roll)', color='r')
+    plt.plot(time_axis, w_body[:, 1], label='w_y (Pitch)', color='g')
+    plt.plot(time_axis, w_body[:, 2], label='w_z (Yaw)', color='b')
+    plt.title(f"Fig 2: Env {env_idx+1} - Body Angular Velocity (w_body)")
+    plt.xlabel("Time (s)")
+    plt.ylabel("Angular Velocity (rad/s)")
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.legend()
+    fig2.savefig(os.path.join(save_dir, "2_w_body.png"), dpi=200, bbox_inches='tight')
+
+    # [图4]
+    fig4 = plt.figure(figsize=(10, 5))
+    plt.plot(time_axis, cmd_thrust, label='Thrust Cmd', color='purple')
+    plt.title(f"Fig 4: Env {env_idx+1} - Total Thrust Command")
+    plt.xlabel("Time (s)")
+    plt.ylabel("Command (Normalized)")
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.legend()
+    fig4.savefig(os.path.join(save_dir, "4_cmd_thrust.png"), dpi=200, bbox_inches='tight')
+
+    # [图5]
+    fig5 = plt.figure(figsize=(10, 5))
+    plt.plot(time_axis, cmd_br[:, 0], label='Cmd w_x', color='r', linestyle='--')
+    plt.plot(time_axis, cmd_br[:, 1], label='Cmd w_y', color='g', linestyle='--')
+    plt.plot(time_axis, cmd_br[:, 2], label='Cmd w_z', color='b', linestyle='--')
+    plt.title(f"Fig 5: Env {env_idx+1} - Body Rate Command")
+    plt.xlabel("Time (s)")
+    plt.ylabel("Angular Velocity (rad/s)")
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.legend()
+    fig5.savefig(os.path.join(save_dir, "5_cmd_br.png"), dpi=200, bbox_inches='tight')
+
+    # [图6]
+    fig6 = plt.figure(figsize=(10, 5))
+    plt.plot(time_axis, dist_acc[:, 0], label='Disturbance a_x', color='r')
+    plt.plot(time_axis, dist_acc[:, 1], label='Disturbance a_y', color='g')
+    plt.plot(time_axis, dist_acc[:, 2], label='Disturbance a_z', color='b')
+    plt.title(f"Fig 6: Env {env_idx+1} - Ground Truth Disturbance Acc")
+    plt.xlabel("Time (s)")
+    plt.ylabel("Acceleration (m/s^2)")
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.legend()
+    fig6.savefig(os.path.join(save_dir, "6_disturbance.png"), dpi=200, bbox_inches='tight')
+
+    plt.close('all')
+    print("Plots saved successfully!")
+
+if __name__ == "__main__":
+    visualize_trajectory()

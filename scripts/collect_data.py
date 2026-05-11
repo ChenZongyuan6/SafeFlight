@@ -1,0 +1,204 @@
+import logging
+import os
+import time
+import hydra
+import torch
+import numpy as np
+import datetime
+from omegaconf import OmegaConf
+
+from omni_drones import CONFIG_PATH, init_simulation_app
+from omni_drones.utils.torchrl import SyncDataCollector, AgentSpec
+from omni_drones.utils.torchrl.transforms import (
+    FromMultiDiscreteAction, 
+    FromDiscreteAction,
+    ravel_composite,
+    History
+)
+from omni_drones.learning import (
+    MAPPOPolicy, HAPPOPolicy, QMIXPolicy, DQNPolicy, SACPolicy, TD3Policy, 
+    MATD3Policy, TDMPCPolicy, Policy, PPOPolicy, PPOAdaptivePolicy, PPORNNPolicy
+)
+
+from setproctitle import setproctitle
+from torchrl.envs.transforms import (
+    TransformedEnv, 
+    InitTracker, 
+    Compose,
+)
+from tqdm import tqdm
+
+@hydra.main(version_base=None, config_path=CONFIG_PATH, config_name="train_collect_pinn0504")
+def main(cfg):
+    # 1. 强制覆盖配置，确保采集模式正确
+    OmegaConf.register_new_resolver("eval", eval)
+    OmegaConf.resolve(cfg)
+    cfg.task.env.num_envs = 4096  # [建议] 强制设置较大的并行数量以快速采集
+    cfg.headless = True           # [强制] 开启无头模式，无需渲染，极大提高速度
+    
+    print(f"Start Data Collection with {cfg.task.env.num_envs} environments...")
+    print(OmegaConf.to_yaml(cfg))
+
+    # 2. 初始化仿真应用
+    simulation_app = init_simulation_app(cfg)
+    
+    # 3. 导入环境类 (这里会自动加载我们修改过的 TrackPINN)
+    from omni_drones.envs.isaac_env import IsaacEnv
+    
+    # 获取算法类
+    algos = {
+        "ppo": PPOPolicy, "ppo_adaptive": PPOAdaptivePolicy, "ppo_rnn": PPORNNPolicy,
+        "mappo": MAPPOPolicy, "happo": HAPPOPolicy, "qmix": QMIXPolicy, "dqn": DQNPolicy,
+        "sac": SACPolicy, "td3": TD3Policy, "matd3": MATD3Policy, "tdmpc": TDMPCPolicy,
+        "test": Policy
+    }
+
+    # 4. 初始化环境
+    # 注意：这里会加载 yaml 中指定的 task.name，稍后在 yaml 中我们需将其改为 TrackPINN
+    env_class = IsaacEnv.REGISTRY[cfg.task.name]
+    base_env = env_class(cfg, headless=True) # 强制 headless
+
+    # 5. 设置 Transforms (为了适配 Policy 的输入格式，必须保持与训练时一致)
+    transforms = [InitTracker()]
+    
+    # 根据配置添加 flatten 等变换
+    if cfg.task.get("flatten_obs", False):
+        transforms.append(ravel_composite(base_env.observation_spec, ("agents", "observation")))
+    if cfg.task.get("flatten_state", False):
+        transforms.append(ravel_composite(base_env.observation_spec, ("agents", "state")))
+    if cfg.task.get("history", False):
+        transforms.append(History([("agents", "observation")], steps=4))
+    
+    # Action transform
+    action_transform: str = cfg.task.get("action_transform", None)
+    if action_transform is not None:
+        if action_transform == "PIDrate":
+            from omni_drones.controllers import PIDRateController as _PIDRateController
+            from omni_drones.utils.torchrl.transforms import PIDRateController
+            controller = _PIDRateController(cfg.sim.dt, 9.81, base_env.drone.params).to(base_env.device)
+            transforms.append(PIDRateController(controller))
+        elif action_transform == "PIDrate_FM":
+            from omni_drones.controllers import PID_controller_flightmare as _PID_controller_flightmare
+            from omni_drones.utils.torchrl.transforms import PIDRateController_flightmare
+            controller = _PID_controller_flightmare(cfg.sim.dt, base_env.drone.params, base_env.device).to(base_env.device)
+            transforms.append(PIDRateController_flightmare(controller))
+        # ... (保留原有的其他 action transform 逻辑以防万一)
+
+    env = TransformedEnv(base_env, Compose(*transforms))
+    env.set_seed(cfg.seed)
+
+    # 6. 加载策略 (Actor)
+    agent_spec: AgentSpec = env.agent_spec["drone"]
+    policy = algos[cfg.algo.name.lower()](cfg.algo, agent_spec=agent_spec, device="cuda")
+
+    if cfg.model_dir is not None:
+        print(f"Loading nominal policy from: {cfg.model_dir}")
+        policy.load_state_dict(torch.load(cfg.model_dir))
+    else:
+        raise ValueError("Error: 'model_dir' must be provided to load the nominal policy!")
+
+    # 7. 开始采集数据
+    @torch.no_grad()
+    def collect():
+        env.eval()
+        # policy.eval()
+        # [替换为] 对内部模块分别调用 eval
+        if hasattr(policy, "actor"):
+            policy.actor.eval()
+        if hasattr(policy, "critic"):
+            policy.critic.eval()
+        
+        print("Collecting data rollout...")
+        # rollout 会自动运行 env.reset() 并收集 max_episode_length 步的数据
+        # 返回的 trajs 是一个 TensorDict，形状通常为 [num_envs, max_steps]
+        trajs = env.rollout(
+            max_steps=base_env.max_episode_length,
+            policy=lambda x: policy(x, deterministic=True), # 采集数据建议用确定性策略
+            auto_reset=True,
+            break_when_any_done=False,
+            return_contiguous=False  # [2026-05-06 优化] 避免全量 contiguous 导致 OOM；只对用到的 key 单独提取
+        )
+        return trajs
+
+    # 执行采集
+    trajs = collect()
+    
+    print("Rollout finished. Extracting PINN dataset...")
+    
+    # 8. 数据提取与处理（只对 3 个用到的 key 调用 contiguous，跳过 obs/state/stats 等无关 key）
+    # trajs 的结构: batch_size = [num_envs, time_steps]
+    
+    # [Input Part 1] 物理状态特征 (来自 track_pinn.py 中的 info)
+    # 形状: (Num_Envs, Time_Steps, 15)
+    pinn_state = trajs[("next", "info", "pinn_features")].contiguous()
+    
+    # [Input Part 2] 动作指令 (CTBR)
+    # 形状: (Num_Envs, Time_Steps, 4)
+    actions = trajs[("agents", "action")].contiguous()
+    # 挤掉 Agent 维度，变成 [Num_Envs, Time_Steps, 4]
+    if actions.dim() == 4:
+        actions = actions.squeeze(2)
+    
+    # [Label] 真实扰动 (Ground Truth)
+    # 形状: (Num_Envs, Time_Steps, 3)
+    gt_disturbance = trajs[("next", "info", "gt_disturbance")].contiguous()
+
+    # 检查是否有 NaN
+    if torch.isnan(pinn_state).any() or torch.isnan(gt_disturbance).any():
+        print("Warning: NaNs detected in collected data!")
+    
+    # 9. 拼接构建最终数据集
+    # Input X = [State (15) + Action (4)] = 19维
+    X_inputs = torch.cat([pinn_state, actions], dim=-1)
+    Y_labels = gt_disturbance
+
+    # 将数据拉平 (Flatten batch and time dimensions)
+    # (Num_Envs * Time_Steps, Dim)
+    X_inputs_flat = X_inputs.reshape(-1, X_inputs.shape[-1])
+    Y_labels_flat = Y_labels.reshape(-1, Y_labels.shape[-1])
+    
+    # 10. 保存到文件
+    # dataset = {
+    #     "inputs": X_inputs_flat.cpu(), # 转到 CPU 保存节省显存
+    #     "labels": Y_labels_flat.cpu(),
+    #     "metadata": {
+    #         "features": ["v_body(3)", "w_body(3)", "R_flat(9)", "action_ctbr(4)"],
+    #         "labels": ["acc_res_body(3)"],
+    #         "description": "Dataset for PINN Disturbance Observer"
+    #     }
+    # }
+    # [建议修改] 直接保存 3D 张量，不要 flatten
+    dataset = {
+        # inputs 形状: [Envs, Time, 19] -> [8192, 1000, 19]
+        "inputs": X_inputs.cpu(), 
+        # labels 形状: [Envs, Time, 3]  -> [8192, 1000, 3]
+        "labels": Y_labels.cpu(),
+        "metadata": {
+            "features": ["v_body(3)", "w_body(3)", "R_flat(9)", "action_ctbr(4)"],
+            "labels": ["acc_res_body(3)"],
+            "description": "Dataset for PINN Disturbance Observer (3D Tensor: Batch x Time x Feat)"
+        }
+    }
+    
+    # save_path = "pinn_dataset.pt"
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+    save_dir = "collected_data"
+    os.makedirs(save_dir, exist_ok=True)
+    # 创建一个同名文件夹
+    folder_name = f"dataset_{timestamp}"
+    folder_path = os.path.join(save_dir, folder_name)
+    os.makedirs(folder_path, exist_ok=True)
+
+    save_path = os.path.join(folder_path, f"dataset_test_{timestamp}.pt")
+    torch.save(dataset, save_path)
+    
+    print(f"Data collection complete!")
+    print(f"Total samples: {X_inputs_flat.shape[0]}")
+    print(f"Input shape: {X_inputs_flat.shape}")
+    print(f"Label shape: {Y_labels_flat.shape}")
+    print(f"Saved to: {os.path.abspath(save_path)}")
+
+    simulation_app.close()
+
+if __name__ == "__main__":
+    main()

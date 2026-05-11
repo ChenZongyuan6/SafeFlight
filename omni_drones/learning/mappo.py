@@ -58,7 +58,9 @@ class MAPPOPolicy(object):
     ) -> None:
         super().__init__()
 
-        self.cfg = cfg
+        from omegaconf import OmegaConf
+        self.cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
+        OmegaConf.set_struct(self.cfg, False)
         self.agent_spec = agent_spec
         self.device = device
 
@@ -314,7 +316,7 @@ class MAPPOPolicy(object):
             dist_entropy = actor_output[f"{self.agent_spec.name}.action_entropy"]
             assert advantages.shape == log_probs_new.shape == dist_entropy.shape
 
-        ratio = torch.exp(log_probs_new - log_probs_old)
+        ratio = torch.exp(torch.clamp(log_probs_new - log_probs_old, -20.0, 20.0))
         surr1 = ratio * advantages
         surr2 = (
             torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param)
@@ -471,7 +473,7 @@ class MAPPOPolicy(object):
         return state_dict
     
     def load_state_dict(self, state_dict):
-        self.actor_params = TensorDictParams(state_dict["actor_params"].to_tensordict())
+        self.actor_params = TensorDictParams(state_dict["actor_params"].to_tensordict().to(self.device))
         self.actor_opt = torch.optim.Adam(self.actor_params.parameters(), lr=self.cfg.actor.lr)
         self.critic.load_state_dict(state_dict["critic"])
         self.value_normalizer.load_state_dict(state_dict["value_normalizer"])

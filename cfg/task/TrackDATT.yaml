@@ -1,0 +1,73 @@
+name: TrackDATT
+# -----------------------------------------------------------------------
+# DATT GT-oracle baseline
+# Phase 1: single end-to-end MAPPO policy with GT wind vector in obs.
+# This is the oracle upper bound (DATT arXiv:2310.09053, Phase 1).
+# -----------------------------------------------------------------------
+
+defaults:
+  - /base/env_base@_here_
+  - /base/sim_base@_here_
+
+env:
+  num_envs: 4096
+  max_episode_length: 1000
+
+drone_model: Air
+force_sensor: false
+time_encoding: false
+wind: true
+
+latency: false
+latency_step: 1
+random_latency: true
+
+# ---- DATT-specific ----
+# wind_mode: "sinusoidal"  -- identical to Track (8-freq sinusoidal), default, fair comparison
+# wind_mode: "constant"   -- episode-constant wind (original DATT paper setting)
+wind_mode: "sinusoidal"
+wind_max: 1.0            # only used when wind_mode=constant, [m/s^2] per axis
+include_gt_wind: true    # append GT wind acceleration to obs (the adaptive input)
+
+# ---- trajectory ----
+reset_thres: 1.
+future_traj_steps: 10
+time_encoding_dim: 4
+
+# ---- eval ----
+use_eval: false #true
+eval_no_reset: true   # [20260506] 强制跑满 1000 步，禁用所有提前 reset
+eval_traj: 'normal'
+
+# ---- misc ----
+use_rotor2critic: 0
+use_action_history: false
+action_history_step: 5
+use_ab_wolrd_pos: false
+
+# ---- reward weights ----
+reward_up_weight: 1.0
+reward_spin_weight: 1.0
+reward_acc_weight_init: 0.0
+reward_acc_weight_lr: 0.0005
+reward_acc_max: 0.0
+reward_jerk_weight_init: 0.0
+reward_jerk_weight_lr: 0.0005
+reward_jerk_max: 0.0
+reward_snap_weight_init: 0.0
+reward_snap_weight_lr: 0.0005
+reward_snap_max: 0.0
+# reward_action_smoothness_weight_init: 2.0  # SimpleFlight Factor3, disabled for DATT faithful reproduction
+# reward_action_smoothness_weight_lr: 0.0005
+# reward_smoothness_max: 2.0
+reward_action_smoothness_weight_init: 0.0
+reward_action_smoothness_weight_lr: 0.0
+reward_smoothness_max: 0.0
+reward_action_norm_weight_init: 0.0
+reward_action_norm_weight_lr: 0.0001
+reward_norm_max: 0.0
+reward_distance_scale: 5.0
+
+action_transform: PIDrate_FM
+flatten_obs: false
+flatten_state: false

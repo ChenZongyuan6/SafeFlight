@@ -413,8 +413,14 @@ class MultirotorBase(RobotBase):
                 quat_rotate(self.rot, self.thrusts.sum(-2)),
                 kz=0.3
             ).sum(-2)
-        self.forces[:] += (self.drag_coef * self.masses) * self.vel[..., :3]
-
+        # self.forces[:] += (self.drag_coef * self.masses) * self.vel[..., :3]
+        # [修改] 使用二次气动阻力模型 (Quadratic Drag)
+        # F = -k * v * |v|
+        # self.drag_coef 的值此时恒等于air.yaml中的设定值
+        vel_world = self.vel[..., :3]
+        vel_norm = torch.norm(vel_world, dim=-1, keepdim=True)
+        # 注意用 -= (阻力方向与速度相反)
+        self.forces[:] -= self.drag_coef * vel_world * vel_norm
         self.rotors_view.apply_forces_and_torques_at_pos(
             self.thrusts.reshape(-1, 3), 
             positions=self.rotor_pos_offset,

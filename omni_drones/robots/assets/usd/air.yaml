@@ -26,7 +26,12 @@ mass: 0.783 # add 0.147(imu and rotors), old 0.804
 #2025-202601 used: 0.783 total: 0.93
 #total mass = mass(here) + 0.147(imu and rotors)
 l: 0.250
-drag_coef: 0.0
+# drag_coef: 0.0  #训练rl时设置为0，认为在真空中飞行，采集数据时才加上-20260321
+# [PINN采集数据时修改] 将 0.0 改为 0.1 或 0.2。
+# 这代表一个名义上的线性阻力系数，F = -k * v * m
+# 如果我们稍后改为二次阻力，这个值需要重新调整，但先设为非零是第一步。
+drag_coef: 0.02
+
 rotor_configuration:
   arm_lengths:
   - 0.125

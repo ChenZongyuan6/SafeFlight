@@ -42,7 +42,8 @@ from torchrl.envs import EnvBase
 
 from omni_drones.robots.robot import RobotBase
 from omni_drones.utils.torchrl import AgentSpec
-
+#260304添加
+from omegaconf import open_dict
 
 class IsaacEnv(EnvBase):
 
@@ -279,7 +280,9 @@ class IsaacEnv(EnvBase):
         if self.enable_viewport:
             # enable scene querying if rendering is enabled
             # this is needed for some GUI features
-            sim_params["enable_scene_query_support"] = True
+            with open_dict(sim_params):
+                sim_params["enable_scene_query_support"] = True
+            # sim_params["enable_scene_query_support"] = True
             # load extra viewport extensions if requested
             if self.enable_viewport:
                 # extension to enable UI buttons (otherwise we get attribute errors)

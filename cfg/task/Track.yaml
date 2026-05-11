@@ -1,4 +1,6 @@
-name: Track
+name: Track   #这里注意要根据任务修改 
+#决定“真正创建哪个环境类” 如果是正常Track训练或验证（原版），调用Track，如果是有绕动的数据采集，调用TrackPINN
+#Track   TrackPINN 
 
 defaults:
   # see https://hydra.cc/docs/advanced/overriding_packages/
@@ -6,13 +8,13 @@ defaults:
   - /base/sim_base@_here_
 
 env:
-  num_envs: 8192  #8192
+  num_envs: 4096  #8192
   max_episode_length: 1000
 
 drone_model: Air #Crazyflie air
 force_sensor: false
 time_encoding: false
-wind: false
+wind: true # 原本是flase 改成true后启动风扰动
 latency: false
 latency_step: 1
 random_latency: true
@@ -21,8 +23,8 @@ reset_thres: 1.
 future_traj_steps: 10
 time_encoding_dim: 4
 
-use_eval: 0    #ture 0
-eval_traj: 'fast' # poly, zigzag, pentagram, slow, normal, fast
+use_eval: false   # [20260511] 训练时用混合随机轨迹（ChainedPoly+Zigzag）
+eval_traj: 'normal' # poly, zigzag, pentagram, slow, normal, fast
 use_rotor2critic: 0 # need to set critic_input = 'state'
 use_action_history: false
 action_history_step: 5
@@ -70,3 +72,37 @@ flatten_state: false  # 建议同时扁平化 state，以防 Critic 报错
       # drag_coef: [0.9, 1.1]
       # tau_scale: [1.3, 1.3]
       # t2w_scale: [0.7, 0.7]
+# ======================================================================
+# 扰动配置说明（与 TrackResidual.yaml 逻辑完全相同）
+# obs 中不包含扰动信息，base policy 靠自适应应对
+# ----------------------------------------------------------------------
+# [2026-05-06 重构] wind 作为总开关，disturbance.mode 决定类型，enable 参数已移除。
+# 原版备份：cfg/task/Track_backup_20260506.yaml
+#
+# 切换说明：
+#   wind: false                          → 关闭所有扰动
+#   wind: true  (不写 disturbance 块)    → 旧 sinsum（向后兼容）
+#   wind: true  + disturbance.mode: "composite" → 新三维复合扰动（推荐训 base policy）
+#
+# 如需开启 composite 扰动，保持 wind: true 并取消下方注释：
+
+disturbance:                       # [20260511] 明确指定 sinsum 全三轴，与 04-25/04-16 训练环境一致
+  mode: "sinsum"                   # 与 DATT/Residual 训练时一致
+  horizontal_only: false           # false: 全三轴XYZ扰动（训练时Z轴有扰动）
+#   clip_total: false              # true: 对总扰动幅度截断；false: 不截断
+#   bias:
+#     enable: true
+#     range_train: [-2.0, 2.0]    # 训练时每轴 bias 均匀采样范围 (m/s²)
+#     range_eval:  [-2.0, 2.0]    # 评估时范围
+#   gauss_markov:
+#     enable: true
+#     sigma_range_train: [0.2, 0.8]  # 训练时 GM 噪声强度范围
+#     sigma_range_eval:  [0.2, 0.8]  # 评估时范围
+#     tau_range: [0.5, 2.0]          # 相关时间常数 (s)
+#     reset_to_zero: true            # episode 开始时是否归零
+#   swing:
+#     enable: true
+#     amp_range_train: [0.0, 0.5]    # 训练时振幅范围 (m/s²)
+#     amp_range_eval:  [0.0, 0.5]    # 评估时范围
+#     freq_range: [0.3, 1.2]         # 频率范围 (Hz)
+#     random_phase: true             # 随机初相位

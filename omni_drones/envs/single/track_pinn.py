@@ -1,3 +1,4 @@
+#这个代码是再track.py基础上修改出来的用来采集数据的环境
 from functorch import vmap
 
 import omni.isaac.core.utils.torch as torch_utils
@@ -62,6 +63,22 @@ class TrackPINN(IsaacEnv):
         super().__init__(cfg, headless)
 
         self.drone.initialize()
+        # ========================================================
+        # 新增：读取每个环境的整机总质量，形状为 [num_envs, 1]
+        # 用于：
+        # 1. 风加速度 -> 风力 的换算
+        # 2. drag force -> drag acceleration 标签 的换算
+        # ========================================================
+        self.total_mass = self.drone._view.get_body_masses().sum(-1).unsqueeze(-1)
+
+        print("===== TrackPINN mass check =====")
+        print("air.yaml mass -> self.drone.mass:", self.drone.mass)
+        print("self.drone.MASS_0:", self.drone.MASS_0)
+        print("self.drone.masses[0]:", self.drone.masses[0])
+        print("base_link.get_masses()[0]:", self.drone.base_link.get_masses()[0])
+        print("body masses sum env0:", self.drone._view.get_body_masses()[0].sum())
+        print("===============================")
+
         randomization = self.cfg.task.get("randomization", None)
         if randomization is not None:
             if "drone" in self.cfg.task.randomization:
@@ -159,6 +176,13 @@ class TrackPINN(IsaacEnv):
         
         self.prev_actions = torch.zeros(self.num_envs, self.num_drones, 4, device=self.device)
         self.count = 0 
+        # ========================================================
+        # [新增] 打印无人机物理参数，用于提取 PINN 需要的最大推力和质量
+        # ========================================================
+        print(f"=====================================")
+        print(f"无人机质量: {self.drone.MASS_0}")
+        print(f"最大总推力: {self.drone.KF_0.sum()}")
+        print(f"=====================================")
 
     def _design_scene(self):
         drone_model = MultirotorBase.REGISTRY[self.cfg.task.drone_model]
@@ -328,6 +352,8 @@ class TrackPINN(IsaacEnv):
         if self.wind:
             self.wind_i[env_ids] = torch.rand(*env_ids.shape, 1, device=self.device) * (self.wind_intensity_high-self.wind_intensity_low) + self.wind_intensity_low
             self.wind_w[env_ids] = torch.randn(*env_ids.shape, 3, 8, device=self.device)
+        # 更新整机总质量，确保与 reset / randomization 后的真实质量一致
+        self.total_mass = self.drone._view.get_body_masses().sum(-1).unsqueeze(-1)  
 
     def _pre_sim_step(self, tensordict: TensorDictBase):        
         actions = tensordict[("agents", "action")]
@@ -342,44 +368,128 @@ class TrackPINN(IsaacEnv):
 
         self.effort = self.drone.apply_action(actions)
 
+        # [新增] 定义无人机实际的总物理质量
+        # TOTAL_MASS = 0.93
         if self.wind:
             t = (self.progress_buf * self.dt).reshape(-1, 1, 1)
-            # 计算世界坐标系下的风力加速度 (Specific Force, m/s^2)
+            # 世界系风加速度，形状 [num_envs, 3]
             self.wind_force = self.wind_i * torch.sin(t * self.wind_w).sum(-1)
-            
-            # [修改 2] 捕获 Ground Truth 扰动标签 (Label Y)
-            # 将世界系下的风扰动加速度 旋转到 机体坐标系
-            # 取 self.drone.rot 作为当前姿态进行坐标变换
-            disturbance_body = quat_rotate_inverse(self.drone.rot, self.wind_force.unsqueeze(1)) 
-            
-            # 存入 info，供 collect_data 脚本提取
+            # 世界系线速度，形状 [num_envs, 1, 3]
+            vel_world = self.drone.vel[..., :3]
+            # 速度模长，形状 [num_envs, 1, 1]
+            vel_norm = torch.norm(vel_world, dim=-1, keepdim=True)
+            # ========================================================
+            # 真实 drag force 在底层 apply_action() 中已经是：
+            # F_drag = - drag_coef * v * |v|
+            #
+            # 因此这里为了生成 PINN 的加速度标签，需要除以整机总质量
+            #
+            # self.drone.drag_coef: [num_envs, 1, 1]
+            # vel_world:            [num_envs, 1, 3]
+            # vel_norm:             [num_envs, 1, 1]
+            # self.total_mass:      [num_envs, 1]
+            #
+            # 为了和 [num_envs, 1, 3] 对齐，这里先 unsqueeze(1)
+            # 变成 [num_envs, 1, 1]
+            # ========================================================
+            total_mass_expanded = self.total_mass.unsqueeze(1)  # [num_envs, 1, 1]
+            drag_acc_world = - (self.drone.drag_coef * vel_world * vel_norm) / total_mass_expanded
+            # self.wind_force 是 [num_envs, 3]，要变成 [num_envs, 1, 3]
+            wind_acc_world = self.wind_force.unsqueeze(1)
+            # 总扰动加速度标签（世界系）
+            total_disturbance_world = wind_acc_world + drag_acc_world
+            # 转到机体系，作为监督标签
+            disturbance_body = quat_rotate_inverse(self.drone.rot, total_disturbance_world)
             self.info["gt_disturbance"][:] = disturbance_body.squeeze(1)
-
-            # 施加到物理引擎 (世界坐标系)
-            wind_forces = self.drone.MASS_0 * self.wind_force
+            # ========================================================
+            # 用整机总质量把风加速度换成风力
+            # self.total_mass: [num_envs, 1]
+            # self.wind_force: [num_envs, 3]
+            # 得到 [num_envs, 3]
+            # ========================================================
+            wind_forces = self.total_mass * self.wind_force
             wind_forces = wind_forces.unsqueeze(1).expand(*self.drone.shape, 3)
             self.drone.base_link.apply_forces(wind_forces, is_global=True)
+
         else:
-            # 如果没开风，标签为 0
-            self.info["gt_disturbance"].zero_()
+            vel_world = self.drone.vel[..., :3]
+            vel_norm = torch.norm(vel_world, dim=-1, keepdim=True)
+            total_mass_expanded = self.total_mass.unsqueeze(1)  # [num_envs, 1, 1]
+            drag_acc_world = - (self.drone.drag_coef * vel_world * vel_norm) / total_mass_expanded
+
+            disturbance_body = quat_rotate_inverse(self.drone.rot, drag_acc_world)
+            self.info["gt_disturbance"][:] = disturbance_body.squeeze(1)
+
+        # if self.wind:
+        #     t = (self.progress_buf * self.dt).reshape(-1, 1, 1)
+        #     # 计算世界坐标系下的风力加速度 (Specific Force, m/s^2)
+        #     # 公式：Sum( Intensity * sin(Frequency * t) )
+        #     self.wind_force = self.wind_i * torch.sin(t * self.wind_w).sum(-1)
+           
+        #     # 2. 内部空气阻力 (世界系，来自 multirotors.py 的计算逻辑)
+        #     vel_world = self.drone.vel[..., :3]
+        #     vel_norm = torch.norm(vel_world, dim=-1, keepdim=True)
+        #     # F_drag = - drag_coef * v * |v|
+        #     # 加速度 a_drag = F_drag / mass
+        #     drag_acc_world = - (self.drone.drag_coef * vel_world * vel_norm) / TOTAL_MASS
+            
+        #     # 3. 集总扰动加速度 (世界系) = 风力加速度 + 空气阻力加速度
+        #     total_disturbance_world = self.wind_force.unsqueeze(1) + drag_acc_world
+        #     # 4. 旋转到机体坐标系，作为网络的真实 Label
+        #     disturbance_body = quat_rotate_inverse(self.drone.rot, total_disturbance_world)
+        #     # [修改 2] 捕获 Ground Truth 扰动标签 (Label Y)
+        #     # 将世界系下的风扰动加速度 旋转到 机体坐标系
+        #     # 取 self.drone.rot 作为当前姿态进行坐标变换
+        #     # disturbance_body = quat_rotate_inverse(self.drone.rot, self.wind_force.unsqueeze(1)) 
+            
+        #     # 存入 info，供 collect_data 脚本提取
+        #     self.info["gt_disturbance"][:] = disturbance_body.squeeze(1)
+
+        #     # 施加到物理引擎 (世界坐标系)
+        #     wind_forces = TOTAL_MASS * self.wind_force
+        #     wind_forces = wind_forces.unsqueeze(1).expand(*self.drone.shape, 3)
+        #     self.drone.base_link.apply_forces(wind_forces, is_global=True)
+        # else:
+        #     # 如果没开风，标签为 0
+        #     # self.info["gt_disturbance"].zero_()
+        #     # 如果没开风，集总扰动就只剩下空气阻力
+        #     vel_world = self.drone.vel[..., :3]
+        #     vel_norm = torch.norm(vel_world, dim=-1, keepdim=True)
+        #     drag_acc_world = - (self.drone.drag_coef * vel_world * vel_norm) / TOTAL_MASS
+        #     disturbance_body = quat_rotate_inverse(self.drone.rot, drag_acc_world) 
+        #     self.info["gt_disturbance"][:] = disturbance_body.squeeze(1)
 
     def _compute_state_and_obs(self):
         self.root_state = self.drone.get_state()
         self.info["drone_state"][:] = self.root_state[..., :13]
 
         # [修改 3] 提取 PINN 需要的纯净物理特征 (Input Features X)
-        # 提取 机体线速度 (3维)
-        v_body = self.root_state[..., 13:16]
-        # 提取 机体角速度 (3维)
-        w_body = self.root_state[..., 16:19]
-        # 提取 旋转矩阵 (9维)
-        R_flat = self.root_state[..., 19:28]
+        # # 提取 机体线速度 (3维)
+        # v_body = self.root_state[..., 13:16]
+        # # 提取 机体角速度 (3维)
+        # w_body = self.root_state[..., 16:19]
+        # # 提取 旋转矩阵 (9维)
+        # R_flat = self.root_state[..., 19:28]
+        # ========================================================
+        # [关键修复 1] 正确提取机体坐标系下的速度 (v_body, w_body)
+        # omni_drones 已经在 self.drone.vel_b 中算好了机体坐标系下的速度
+        # vel_b 的前 3 维是线速度，后 3 维是角速度
+        # ========================================================
+        v_body = self.drone.vel_b[..., 0:3]   # 机体线速度 (3维)
+        w_body = self.drone.vel_b[..., 3:6]   # 机体角速度 (3维)
+        R_flat = self.root_state[..., 19:28]  # 旋转矩阵 (9维)
+        
+        # # 拼接成特征向量 (15维)
+        # pinn_features = torch.cat([v_body, w_body, R_flat], dim=-1)
+        # # 存入 info
+        # self.info["pinn_features"][:] = pinn_features
         
         # 拼接成特征向量 (15维)
         pinn_features = torch.cat([v_body, w_body, R_flat], dim=-1)
-        
-        # 存入 info
-        self.info["pinn_features"][:] = pinn_features
+
+        # [修改] 使用 .squeeze(1) 去掉中间的 Agent 维度
+        # [8192, 1, 15] -> [8192, 15]
+        self.info["pinn_features"][:] = pinn_features.squeeze(1)
 
         if self.cfg.task.latency:
             self.root_state_buffer.append(self.root_state)
@@ -471,8 +581,8 @@ class TrackPINN(IsaacEnv):
                 "observation": obs,
                 "state": state,
             },
-            "stats": self.stats,  
-            "info": self.info
+            "stats": self.stats.clone(),  # 加上 clone() 确保安全
+            "info": self.info.clone()     # <--- 必须加上 clone() !!!
         }, self.batch_size)
 
     # ================= 以下为未修改部分，直接保留 ================= 

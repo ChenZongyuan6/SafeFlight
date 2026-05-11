@@ -47,6 +47,7 @@ class Track(IsaacEnv):
         assert self.future_traj_steps > 0
         self.wind = cfg.task.wind
         self.use_eval = cfg.task.use_eval
+        self.eval_no_reset = cfg.task.get("eval_no_reset", False)  # [20260506] eval 时禁用所有提前 reset，强制跑满
         self.num_drones = 1
         self.use_rotor2critic = cfg.task.use_rotor2critic
         self.action_history_step = cfg.task.action_history_step
@@ -61,25 +62,85 @@ class Track(IsaacEnv):
         super().__init__(cfg, headless)
 
         self.drone.initialize()
+        # ========================================================
+        # 新增：读取每个环境的整机总质量，形状统一为 [num_envs, 1]
+        # 说明：
+        # self.drone._view.get_body_masses() 形状通常是 [num_envs, num_bodies]
+        # 对最后一个维度求和后得到每个环境的总质量 [num_envs]
+        # 再 unsqueeze(-1) 变成 [num_envs, 1]
+        # 这样后面可以和 [num_envs, 3] 的风加速度直接广播相乘
+        # ========================================================
+        self.total_mass = self.drone._view.get_body_masses().reshape(self.num_envs, -1).sum(-1, keepdim=True)  # [num_envs, 1]
+
+        print("===== Track mass check =====")
+        print("air.yaml mass -> self.drone.mass:", self.drone.mass)
+        print("self.drone.MASS_0:", self.drone.MASS_0)
+        print("self.drone.masses[0]:", self.drone.masses[0])
+        print("base_link.get_masses()[0]:", self.drone.base_link.get_masses()[0])
+        print("body masses sum env0:", self.drone._view.get_body_masses()[0].sum())
+        print("self.total_mass shape:", self.total_mass.shape)
+        print("self.total_mass[0]:", self.total_mass[0])
+        print("============================")
+
         randomization = self.cfg.task.get("randomization", None)
         if randomization is not None:
             if "drone" in self.cfg.task.randomization:
                 self.drone.setup_randomization(self.cfg.task.randomization["drone"])
 
+        # [2026-05-06 重构] 原旧 sinsum 与 composite 两段独立 if，存在双重施力 bug，
+        # 统一为 wind 作为总开关，disturbance.mode 决定类型，移除 enable 参数。
+        # 原代码已注释保留如下：
+        # if self.wind:  # 旧 sinsum buffer 初始化
+        #     if randomization is not None:
+        #         if "wind" in self.cfg.task.randomization:
+        #             cfg = self.cfg.task.randomization["wind"]
+        #             wind_intensity_scale = cfg['train'].get("intensity", None)
+        #             self.wind_intensity_low = wind_intensity_scale[0]
+        #             self.wind_intensity_high = wind_intensity_scale[1]
+        #     else:
+        #         self.wind_intensity_low = 0
+        #         self.wind_intensity_high = 2
+        #     self.wind_w = torch.zeros(self.num_envs, 3, 8, device=self.device)
+        #     self.wind_i = torch.zeros(self.num_envs, 1, device=self.device)
+        # dist_cfg = cfg.task.get("disturbance", None)
+        # self.disturbance_enable = (dist_cfg is not None) and dist_cfg.get("enable", False)
+        # if self.disturbance_enable:  # 旧 composite/新模型 buffer 初始化（独立于 wind）
+        #     ...（见 git history）
         if self.wind:
-            if randomization is not None:
-                if "wind" in self.cfg.task.randomization:
-                    cfg = self.cfg.task.randomization["wind"]
-                    # for phase in ("train", "eval"):
-                    wind_intensity_scale = cfg['train'].get("intensity", None)
-                    self.wind_intensity_low = wind_intensity_scale[0]
-                    self.wind_intensity_high = wind_intensity_scale[1]
-            else:
-                self.wind_intensity_low = 0
-                self.wind_intensity_high = 2
-            self.wind_w = torch.zeros(self.num_envs, 3, 8, device=self.device)
-            self.wind_i = torch.zeros(self.num_envs, 1, device=self.device)
-        
+            # wind=True 时统一初始化扰动模型
+            # mode 由 disturbance.mode 决定，默认 "sinsum"（向后兼容）
+            dist_cfg = self.cfg.task.get("disturbance", {}) or {}
+            self.dist_cfg = dist_cfg
+            self.dist_mode = dist_cfg.get("mode", "sinsum")
+            self.dist_horizontal_only = dist_cfg.get("horizontal_only", True)
+            self.dist_clip_total = dist_cfg.get("clip_total", True)
+            self.dist_max_acc_train = dist_cfg.get("max_total_acc_train", 3.0)
+            self.dist_max_acc_eval = dist_cfg.get("max_total_acc_eval", 3.5)
+            self.dist_max_acc = self.dist_max_acc_eval if self.use_eval else self.dist_max_acc_train
+            self.dist_acc = torch.zeros(self.num_envs, 3, device=self.device)
+            self.dist_force = torch.zeros(self.num_envs, 3, device=self.device)
+
+            if self.dist_mode == "sinsum":
+                if randomization is not None and "wind" in self.cfg.task.get("randomization", {}):
+                    wind_cfg = self.cfg.task.randomization["wind"]
+                    intensity_range = wind_cfg['train'].get("intensity", [0.0, 2.0])
+                else:
+                    intensity_range = dist_cfg.get("sinsum", {}).get("intensity_range", [0.0, 2.0])
+                self.dist_intensity_low = intensity_range[0]
+                self.dist_intensity_high = intensity_range[1]
+                self.dist_num_freqs = dist_cfg.get("sinsum", {}).get("num_freqs", 8)
+                self.wind_w = torch.zeros(self.num_envs, 3, self.dist_num_freqs, device=self.device)
+                self.wind_i = torch.zeros(self.num_envs, 1, device=self.device)
+            elif self.dist_mode == "composite":
+                self.dist_bias = torch.zeros(self.num_envs, 3, device=self.device)
+                self.dist_gm = torch.zeros(self.num_envs, 3, device=self.device)
+                self.dist_gm_sigma = torch.zeros(self.num_envs, 1, device=self.device)
+                self.dist_gm_tau = torch.zeros(self.num_envs, 1, device=self.device)
+                self.dist_gm_alpha = torch.zeros(self.num_envs, 1, device=self.device)
+                self.dist_swing_amp = torch.zeros(self.num_envs, 3, device=self.device)
+                self.dist_swing_freq = torch.zeros(self.num_envs, 1, device=self.device)
+                self.dist_swing_phase = torch.zeros(self.num_envs, 3, device=self.device)
+
         self.init_rpy_dist = D.Uniform(
             torch.tensor([-.2, -.2, 0.], device=self.device) * torch.pi,
             torch.tensor([0.2, 0.2, 2.], device=self.device) * torch.pi
@@ -106,43 +167,7 @@ class Track(IsaacEnv):
 
         # eval
         if self.use_eval:
-            self.init_rpy_dist = D.Uniform(
-                torch.tensor([-.0, -.0, 0.], device=self.device) * torch.pi,
-                torch.tensor([0., 0., 0.], device=self.device) * torch.pi
-            )
-            if self.eval_traj == 'poly':
-                self.ref = ChainedPolynomial(num_trajs=self.num_envs,
-                                        scale=2.5,
-                                        use_y=True,
-                                        min_dt=1.5,
-                                        max_dt=4.0,
-                                        degree=5,
-                                        origin=self.origin,
-                                        device=self.device)
-            elif self.eval_traj == 'zigzag':
-                self.ref = RandomZigzag(num_trajs=self.num_envs,
-                                    max_D=[1.0, 1.0, 0.0],
-                                    min_dt=1.0,
-                                    max_dt=1.5,
-                                    diff_axis=True,
-                                    origin=self.origin,
-                                    device=self.device)
-            elif self.eval_traj == 'pentagram':
-                self.ref = NPointedStar(num_trajs=self.num_envs,
-                                num_points=5,
-                                origin=self.origin,
-                                speed=1.0,
-                                radius=0.7,
-                                device=self.device)
-            elif self.eval_traj == 'slow':
-                self.ref = Lemniscate(T=15.0, origin=self.origin, device=self.device)
-                self.traj_t0 = torch.ones(self.num_envs, 1, device=self.device) * 15.0 / 4
-            elif self.eval_traj == 'normal':
-                self.ref = Lemniscate(T=5.5, origin=self.origin, device=self.device)
-                self.traj_t0 = torch.ones(self.num_envs, 1, device=self.device) * 5.5 / 4
-            elif self.eval_traj == 'fast':
-                self.ref = Lemniscate(T=3.5, origin=self.origin, device=self.device)
-                self.traj_t0 = torch.ones(self.num_envs, 1, device=self.device) * 3.5 / 4
+            self._apply_eval_traj()
 
         self.last_linear_v = torch.zeros(self.num_envs, 1, device=self.device)
         self.last_angular_v = torch.zeros(self.num_envs, 1, device=self.device)
@@ -160,6 +185,49 @@ class Track(IsaacEnv):
         self.prev_actions = torch.zeros(self.num_envs, self.num_drones, 4, device=self.device)
         # self.prev_prev_actions = torch.zeros(self.num_envs, self.num_drones, 4, device=self.device)
         self.count = 0 # episode of RL training
+
+    def _apply_eval_traj(self):
+        """Rebuild self.ref for the current eval_traj type. Call after setting eval_traj."""
+        self.use_eval = True
+        self.init_rpy_dist = D.Uniform(
+            torch.tensor([-.0, -.0, 0.], device=self.device) * torch.pi,
+            torch.tensor([0., 0., 0.], device=self.device) * torch.pi
+        )
+        if self.eval_traj == 'poly':
+            self.ref = ChainedPolynomial(num_trajs=self.num_envs,
+                                    scale=2.5,
+                                    use_y=True,
+                                    min_dt=1.5,
+                                    max_dt=4.0,
+                                    degree=5,
+                                    origin=self.origin,
+                                    device=self.device)
+        elif self.eval_traj == 'zigzag':
+            self.ref = RandomZigzag(num_trajs=self.num_envs,
+                                max_D=[1.0, 1.0, 0.0],
+                                min_dt=1.0,
+                                max_dt=1.5,
+                                diff_axis=True,
+                                origin=self.origin,
+                                device=self.device)
+        elif self.eval_traj == 'pentagram':
+            self.ref = NPointedStar(num_trajs=self.num_envs,
+                            num_points=5,
+                            origin=self.origin,
+                            speed=1.0,
+                            radius=0.7,
+                            device=self.device)
+        elif self.eval_traj == 'slow':
+            self.ref = Lemniscate(T=15.0, origin=self.origin, device=self.device)
+            self.traj_t0 = torch.ones(self.num_envs, 1, device=self.device) * 15.0 / 4
+        elif self.eval_traj == 'normal':
+            self.ref = Lemniscate(T=5.5, origin=self.origin, device=self.device)
+            self.traj_t0 = torch.ones(self.num_envs, 1, device=self.device) * 5.5 / 4
+        elif self.eval_traj == 'fast':
+            self.ref = Lemniscate(T=3.5, origin=self.origin, device=self.device)
+            self.traj_t0 = torch.ones(self.num_envs, 1, device=self.device) * 3.5 / 4
+        else:
+            raise ValueError(f"Unknown eval_traj: {self.eval_traj}")
 
     def _design_scene(self):
         drone_model = MultirotorBase.REGISTRY[self.cfg.task.drone_model]
@@ -239,6 +307,7 @@ class Track(IsaacEnv):
             "episode_len": UnboundedContinuousTensorSpec(1),
             "tracking_error": UnboundedContinuousTensorSpec(1),
             "tracking_error_ema": UnboundedContinuousTensorSpec(1),
+            "tracking_error_max": UnboundedContinuousTensorSpec(1),  # [20260506] per-episode max distance
             "action_error_order1_mean": UnboundedContinuousTensorSpec(1),
             "action_error_order1_max": UnboundedContinuousTensorSpec(1),
             "action_error_order2_mean": UnboundedContinuousTensorSpec(1),
@@ -339,9 +408,15 @@ class Track(IsaacEnv):
             sizes = [1 for _ in range(len(point_list_0))]
             self.draw.draw_lines(point_list_0, point_list_1, colors, sizes)
 
+        # [2026-05-06 重构] 旧 sinsum 直接 reset + 新 composite 分离 reset → 统一走 _reset_disturbance
+        # 原代码：
+        # if self.wind:
+        #     self.wind_i[env_ids] = torch.rand(...) * ...
+        #     self.wind_w[env_ids] = torch.randn(...)
+        # if self.disturbance_enable:
+        #     self._reset_disturbance(env_ids)
         if self.wind:
-            self.wind_i[env_ids] = torch.rand(*env_ids.shape, 1, device=self.device) * (self.wind_intensity_high-self.wind_intensity_low) + self.wind_intensity_low
-            self.wind_w[env_ids] = torch.randn(*env_ids.shape, 3, 8, device=self.device)
+            self._reset_disturbance(env_ids)
 
     def _pre_sim_step(self, tensordict: TensorDictBase):        
         actions = tensordict[("agents", "action")]
@@ -358,12 +433,17 @@ class Track(IsaacEnv):
 
         self.effort = self.drone.apply_action(actions)
 
+        # [2026-05-06 重构] 旧 sinsum 内联施力 + 新 composite 分离施力 → 统一走 _update_and_apply_disturbance
+        # 原代码：
+        # if self.wind:
+        #     t = (self.progress_buf * self.dt).reshape(-1, 1, 1)
+        #     self.wind_force = self.wind_i * torch.sin(t * self.wind_w).sum(-1)
+        #     wind_forces = self.total_mass.reshape(self.num_envs, 1, 1) * self.wind_force.unsqueeze(1)
+        #     self.drone.base_link.apply_forces(wind_forces, is_global=True)
+        # if self.disturbance_enable:
+        #     self._update_and_apply_disturbance()
         if self.wind:
-            t = (self.progress_buf * self.dt).reshape(-1, 1, 1)
-            self.wind_force = self.wind_i * torch.sin(t * self.wind_w).sum(-1)
-            wind_forces = self.drone.MASS_0 * self.wind_force
-            wind_forces = wind_forces.unsqueeze(1).expand(*self.drone.shape, 3)
-            self.drone.base_link.apply_forces(wind_forces, is_global=True)
+            self._update_and_apply_disturbance()
 
     def _compute_state_and_obs(self):
         self.root_state = self.drone.get_state()
@@ -475,6 +555,7 @@ class Track(IsaacEnv):
         distance = torch.norm(self.rpos[:, [0]], dim=-1)
         self.stats["tracking_error"].add_(-distance)
         self.stats["tracking_error_ema"].lerp_(distance, (1-self.alpha))
+        self.stats["tracking_error_max"].set_(torch.max(self.stats["tracking_error_max"], distance))  # [20260506]
         
         reward_pos = self.reward_distance_scale * torch.exp(-distance)
         
@@ -530,10 +611,16 @@ class Track(IsaacEnv):
         #     | (self.drone.pos[..., 2] < 0.1)
         #     # | (distance > self.reset_thres)
         # )
+        # [20260506] eval_no_reset=True 时禁用所有提前 reset（包括 z-crash 和 distance>thres），强制跑满
+        thres_reset = distance > self.reset_thres
+        z_crash = self.drone.pos[..., 2] < 0.1
+        if self.use_eval and self.eval_no_reset:
+            thres_reset = torch.zeros_like(thres_reset)
+            z_crash = torch.zeros_like(z_crash)
         done = (
             (self.progress_buf >= self.max_episode_length).unsqueeze(-1)
-            | (self.drone.pos[..., 2] < 0.1)
-            | (distance > self.reset_thres)
+            | z_crash
+            | thres_reset
         )
 
         if self.use_eval:
@@ -604,6 +691,7 @@ class Track(IsaacEnv):
                     "reward": reward.unsqueeze(-1)
                 },
                 "done": done,
+                "stats": self.stats.clone(),
             },
             self.batch_size,
         )
@@ -629,3 +717,167 @@ class Track(IsaacEnv):
 
         return target_pos
 
+
+    def _reset_disturbance(self, env_ids: torch.Tensor):
+        """
+        重置指定环境的扰动参数。由 _reset_idx 在 wind=True 时调用。
+        dist_mode 决定分支：sinsum | composite。
+        [2026-05-06 重构] 移除 disturbance_enable guard（由 wind 统一控制）。
+        """
+        # [2026-05-06 重构] 原 guard：if not self.disturbance_enable: return  已移除
+        n = len(env_ids)
+        device = self.device
+
+        if self.use_eval:
+            bias_range = self.dist_cfg.get("bias", {}).get("range_eval", [-2.0, 2.0])
+            gm_sigma_range = self.dist_cfg.get("gauss_markov", {}).get("sigma_range_eval", [0.8, 1.5])
+            swing_amp_range = self.dist_cfg.get("swing", {}).get("amp_range_eval", [0.0, 1.2])
+        else:
+            bias_range = self.dist_cfg.get("bias", {}).get("range_train", [-2.0, 2.0])
+            gm_sigma_range = self.dist_cfg.get("gauss_markov", {}).get("sigma_range_train", [0.2, 0.8])
+            swing_amp_range = self.dist_cfg.get("swing", {}).get("amp_range_train", [0.0, 0.8])
+
+        if self.dist_mode == "sinsum":
+            self.wind_i[env_ids] = (
+                torch.rand(n, 1, device=device)
+                * (self.dist_intensity_high - self.dist_intensity_low)
+                + self.dist_intensity_low
+            )
+            self.wind_w[env_ids] = torch.randn(n, 3, self.dist_num_freqs, device=device)
+
+        elif self.dist_mode == "composite":
+            if self.dist_cfg["bias"].get("enable", True):
+                self.dist_bias[env_ids] = (
+                    torch.rand(n, 3, device=device)
+                    * (bias_range[1] - bias_range[0])
+                    + bias_range[0]
+                )
+            else:
+                self.dist_bias[env_ids] = 0.0
+
+            if self.dist_cfg["gauss_markov"].get("enable", True):
+                sigma = (
+                    torch.rand(n, 1, device=device)
+                    * (gm_sigma_range[1] - gm_sigma_range[0])
+                    + gm_sigma_range[0]
+                )
+                tau_range = self.dist_cfg["gauss_markov"].get("tau_range", [0.5, 2.0])
+                tau = (
+                    torch.rand(n, 1, device=device)
+                    * (tau_range[1] - tau_range[0])
+                    + tau_range[0]
+                )
+                alpha = torch.exp(-self.dt / tau)
+                self.dist_gm_sigma[env_ids] = sigma
+                self.dist_gm_tau[env_ids] = tau
+                self.dist_gm_alpha[env_ids] = alpha
+                if self.dist_cfg["gauss_markov"].get("reset_to_zero", True):
+                    self.dist_gm[env_ids] = 0.0
+            else:
+                self.dist_gm[env_ids] = 0.0
+
+            if self.dist_cfg["swing"].get("enable", True):
+                amp_x = (
+                    torch.rand(n, device=device)
+                    * (swing_amp_range[1] - swing_amp_range[0])
+                    + swing_amp_range[0]
+                )
+                amp_y = (
+                    torch.rand(n, device=device)
+                    * (swing_amp_range[1] - swing_amp_range[0])
+                    + swing_amp_range[0]
+                )
+                freq_range = self.dist_cfg["swing"].get("freq_range", [0.3, 1.2])
+                freq = (
+                    torch.rand(n, 1, device=device)
+                    * (freq_range[1] - freq_range[0])
+                    + freq_range[0]
+                )
+                if self.dist_cfg["swing"].get("random_phase", True):
+                    phase_x = 2.0 * torch.pi * torch.rand(n, device=device)
+                    phase_y = 2.0 * torch.pi * torch.rand(n, device=device)
+                else:
+                    phase_x = torch.zeros(n, device=device)
+                    phase_y = torch.zeros(n, device=device)
+
+                self.dist_swing_amp[env_ids, 0] = amp_x
+                self.dist_swing_amp[env_ids, 1] = amp_y
+                self.dist_swing_freq[env_ids] = freq
+                self.dist_swing_phase[env_ids, 0] = phase_x
+                self.dist_swing_phase[env_ids, 1] = phase_y
+                if not self.dist_horizontal_only:
+                    amp_z = (
+                        torch.rand(n, device=device)
+                        * (swing_amp_range[1] - swing_amp_range[0])
+                        + swing_amp_range[0]
+                    )
+                    phase_z = (
+                        2.0 * torch.pi * torch.rand(n, device=device)
+                        if self.dist_cfg["swing"].get("random_phase", True)
+                        else torch.zeros(n, device=device)
+                    )
+                    self.dist_swing_amp[env_ids, 2] = amp_z
+                    self.dist_swing_phase[env_ids, 2] = phase_z
+                else:
+                    self.dist_swing_amp[env_ids, 2] = 0.0
+                    self.dist_swing_phase[env_ids, 2] = 0.0
+            else:
+                self.dist_swing_amp[env_ids] = 0.0
+                self.dist_swing_freq[env_ids] = 0.0
+                self.dist_swing_phase[env_ids] = 0.0
+
+    def _update_and_apply_disturbance(self):
+        """
+        每步更新并施加扰动力。由 _pre_sim_step 在 wind=True 时调用。
+        dist_mode 决定分支：sinsum | composite。
+        [2026-05-06 重构] 移除 disturbance_enable guard（由 wind 统一控制）。
+        """
+        # [2026-05-06 重构] 原 guard：if not self.disturbance_enable: return  已移除
+        if self.dist_mode == "sinsum":
+            t = (self.progress_buf * self.dt).reshape(self.num_envs, 1, 1)
+            a_dist = self.wind_i * torch.sin(t * self.wind_w).sum(-1)
+            if self.dist_horizontal_only:
+                a_dist[:, 2] = 0.0
+            self.dist_acc[:] = a_dist
+
+        elif self.dist_mode == "composite":
+            a_bias = self.dist_bias.clone()
+
+            eps = torch.randn_like(self.dist_gm)
+            alpha = self.dist_gm_alpha
+            sigma = self.dist_gm_sigma
+            a_gm = alpha * self.dist_gm + sigma * torch.sqrt(1.0 - alpha ** 2) * eps
+            self.dist_gm[:] = a_gm
+            if self.dist_horizontal_only:
+                a_gm[:, 2] = 0.0
+
+            t = (self.progress_buf.float() * self.dt).reshape(-1, 1)
+            phase = self.dist_swing_phase   # [N, 3]
+            freq = self.dist_swing_freq     # [N, 1]
+            amp = self.dist_swing_amp       # [N, 3]
+            a_swing = amp * torch.sin(2.0 * torch.pi * freq * t + phase)  # [N, 3]
+
+            a_dist = a_bias + a_gm + a_swing
+
+            if self.dist_horizontal_only:
+                a_dist[:, 2] = 0.0
+
+            if self.dist_clip_total:
+                max_acc = self.dist_max_acc
+                if self.dist_horizontal_only:
+                    xy = a_dist[:, :2]
+                    norm_xy = torch.linalg.norm(xy, dim=-1, keepdim=True).clamp_min(1e-6)
+                    scale = torch.clamp(max_acc / norm_xy, max=1.0)
+                    a_dist[:, :2] = xy * scale
+                else:
+                    norm_3d = torch.linalg.norm(a_dist, dim=-1, keepdim=True).clamp_min(1e-6)
+                    scale = torch.clamp(max_acc / norm_3d, max=1.0)
+                    a_dist = a_dist * scale
+
+            self.dist_acc[:] = a_dist
+
+        mass = self.total_mass  # [num_envs, 1]
+        dist_force = mass * self.dist_acc  # [num_envs, 3]
+        self.dist_force[:] = dist_force
+        dist_force_expanded = dist_force.unsqueeze(1).expand(self.num_envs, self.drone.n, 3)
+        self.drone.base_link.apply_forces(dist_force_expanded, is_global=True)
