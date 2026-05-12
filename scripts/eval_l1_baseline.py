@@ -51,8 +51,8 @@ MAX_THRUST  = 38.0086
 GRAVITY     = (0.0, 0.0, -9.81)
 
 # L1 hyperparameters
-AS_VALUE    = -0.01   # L1 bandwidth; aligned with DATT (adaptation_module.py: self.A = -0.01)
-ALPHA       = 0.99    # EMA smoothing; aligned with DATT (adaptation_module.py: alpha = 0.99)
+AS_VALUE    = -30   # L1 bandwidth; aligned with DATT (adaptation_module.py: self.A = -0.01)
+ALPHA       = 0.80    # EMA smoothing; aligned with DATT (adaptation_module.py: alpha = 0.99)
 CLIP_VALUE  = 5.0
 
 BASE_SAVE_DIR = "/root/SimpleFlight/scripts/l1_test_output"
@@ -182,6 +182,13 @@ def print_summary(all_rmse: list, header: str, save_path: str):
         f"=== {header} ===",
         f"Test data : {TEST_DATA_PATH}",
         f"Env range : [{all_rmse[0]['env']}, {all_rmse[-1]['env']}]",
+        "",
+        "--- L1 Observer Parameters ---",
+        f"  As_value   : {AS_VALUE}",
+        f"  alpha      : {ALPHA}",
+        f"  clip_value : {CLIP_VALUE}",
+        f"  dt         : {DT}",
+        f"  mass       : {MASS} kg",
         "",
         f"{'Env':>5}  {'RMSE_X':>10}  {'RMSE_Y':>10}  {'RMSE_Z':>10}  {'RMSE_3D':>10}",
         sep,
