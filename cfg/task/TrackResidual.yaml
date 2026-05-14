@@ -17,11 +17,11 @@ latency_step: 1
 random_latency: true
 
 reset_thres: 1.0
-eval_no_reset: true   # true: eval 时禁用 distance>reset_thres 的提前 reset，使 episode 跑满 max_episode_length
+eval_no_reset: false   # train时必须是false,正常reset;true: eval 时禁用 distance>reset_thres 的提前 reset，使 episode 跑满 max_episode_length
 future_traj_steps: 10
 time_encoding_dim: 4
 
-use_eval: true     #true
+use_eval: false     #true
 eval_traj: "normal"   # poly, zigzag, pentagram, slow, normal, fast
 use_rotor2critic: 0
 use_action_history: false
@@ -85,7 +85,8 @@ delta_rate_limit: 0.5
 # frozen base policy path
 # train_residual.py 里会读取
 # =========================
-base_model_dir: /root/SimpleFlight/scripts/outputs/track_None/12-15_01-22/wandb/latest-run/files/checkpoint_final.pt
+base_model_dir: /root/SimpleFlight/scripts/outputs/track_distur/05-11_00-46/wandb/latest-run/files/checkpoint_3486777344.pt
+#/root/SimpleFlight/scripts/outputs/track_None/12-15_01-22/wandb/latest-run/files/checkpoint_final.pt  #20260513之前用的，不加扰动不加利普希斯最好的base model
 #/root/SimpleFlight/scripts/outputs/track_None/01-07_23-25/wandb/latest-run/files/checkpoint_final.pt #这个是加利普希斯约束最好的base model
 #/root/SimpleFlight/scripts/outputs/track_None/12-15_01-22/wandb/latest-run/files/checkpoint_final.pt #这个是不加利普希斯约束最好的base model
 
@@ -94,7 +95,7 @@ base_model_dir: /root/SimpleFlight/scripts/outputs/track_None/12-15_01-22/wandb/
 # train_residual.py 里会读取
 # =========================
 pinn_model_dir: /root/SimpleFlight/scripts/pinncheckpoint/03_20_04_00/best_pi_wan_model.pth
-
+#/root/SimpleFlight/scripts/pinncheckpoint/03_20_04_00/best_pi_wan_model.pth  # 20260513之前用的PINN模型 sinsum数据集训练
 pinn_stats_dataset: /root/SimpleFlight/scripts/collected_data/dataset_20260316_0028/dataset_20260316_0028.pt
 #/你的PINN训练数据集路径/dataset_xxx.pt
 pinn_train_ratio: 0.9

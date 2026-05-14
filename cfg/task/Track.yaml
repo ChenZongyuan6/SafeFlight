@@ -23,7 +23,7 @@ reset_thres: 1.
 future_traj_steps: 10
 time_encoding_dim: 4
 
-use_eval: false   # [20260511] 训练时用混合随机轨迹（ChainedPoly+Zigzag）
+use_eval: false    #ture 0训练时用混合随机轨迹（ChainedPoly+Zigzag）
 eval_traj: 'normal' # poly, zigzag, pentagram, slow, normal, fast
 use_rotor2critic: 0 # need to set critic_input = 'state'
 use_action_history: false
@@ -86,9 +86,9 @@ flatten_state: false  # 建议同时扁平化 state，以防 Critic 报错
 #
 # 如需开启 composite 扰动，保持 wind: true 并取消下方注释：
 
-disturbance:                       # [20260511] 明确指定 sinsum 全三轴，与 04-25/04-16 训练环境一致
-  mode: "sinsum"                   # 与 DATT/Residual 训练时一致
-  horizontal_only: false           # false: 全三轴XYZ扰动（训练时Z轴有扰动）
+# disturbance:
+#   mode: "composite"              # "sinsum"（默认，向后兼容）| "composite"（推荐）
+#   horizontal_only: false         # true: 只施加XY扰动；false: 全三维XYZ
 #   clip_total: false              # true: 对总扰动幅度截断；false: 不截断
 #   bias:
 #     enable: true

@@ -17,7 +17,7 @@ model_dir: null
 # /root/SimpleFlight/scripts/outputs/track/12-10_17-54/wandb/latest-run/files/checkpoint_1992818688.pt
 #null
 
-total_frames: 9000_000_000 #1000_000_000
+total_frames: 1000_000_000 #1000_000_000
 max_iters: -1
 eval_interval: -1
 save_interval: 100
