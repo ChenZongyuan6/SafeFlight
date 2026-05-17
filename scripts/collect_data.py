@@ -132,9 +132,11 @@ def main(cfg):
     # 形状: (Num_Envs, Time_Steps, 15)
     pinn_state = trajs[("next", "info", "pinn_features")].contiguous()
     
-    # [Input Part 2] 动作指令 (CTBR)
+    # [Input Part 2] 动作指令 (CTBR = tanh后的策略输出，严格在(-1,1))
     # 形状: (Num_Envs, Time_Steps, 4)
-    actions = trajs[("agents", "action")].contiguous()
+    # 注意：必须用 ("info","policy_action")，不能用 ("agents","action")
+    # 因为 _inv_call 执行后 ("agents","action") 已被电机指令cmds覆盖
+    actions = trajs[("info", "policy_action")].contiguous()
     # 挤掉 Agent 维度，变成 [Num_Envs, Time_Steps, 4]
     if actions.dim() == 4:
         actions = actions.squeeze(2)

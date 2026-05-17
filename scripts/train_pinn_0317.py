@@ -27,7 +27,7 @@ class Config:
     # [修改] 使用你打印出来的真实值
     MASS =  0.93          # kg
     GRAVITY = 9.81          # m/s^2
-    MAX_THRUST = 38.0086    # [新增] 你的最大真实推力
+    THRUST_CEILING = 15.0   # 推力加速度上限 m/s²（与控制器映射一致: (tanh+1)/2*15.0）
     
     # --- 训练超参数 ---
     BATCH_SIZE = 256        
@@ -159,11 +159,11 @@ class PI_WAN(nn.Module):
 # 4. 物理引擎: 可微标称动力学 
 # ==========================================
 class QuadrotorDynamics(nn.Module):
-    def __init__(self, mass, gravity, dt, max_thrust):
+    def __init__(self, mass, gravity, dt, thrust_ceiling):
         super().__init__()
         self.mass = mass
         self.dt = dt
-        self.max_thrust = max_thrust  
+        self.thrust_ceiling = thrust_ceiling  # 推力加速度上限 m/s²
         self.register_buffer('gravity_vec', torch.tensor([0., 0., -gravity]))
 
     def forward(self, state, disturbance_pred):
@@ -175,13 +175,14 @@ class QuadrotorDynamics(nn.Module):
         
         R = R_flat.view(batch_size, 3, 3)
 
-        # 1. 计算真实的物理推力 (Newtons)
-        throttle_normalized = (u_ctrl[:, 3] + 1.0) / 2.0  
-        thrust_mag = throttle_normalized * self.max_thrust 
+        # 1. 推力加速度 m/s²（与控制器映射完全一致）
+        # 控制器: target_thrust = (tanh(logit)+1)/2 * 15.0 m/s²
+        # 数据集 ch18 = tanh(logit)，直接用同一映射
+        a_thrust_z = (u_ctrl[:, 3] + 1.0) / 2.0 * self.thrust_ceiling  # [0, thrust_ceiling] m/s²
         
         thrust_vec_body = torch.zeros(batch_size, 3, device=state.device)
-        thrust_vec_body[:, 2] = thrust_mag 
-        a_thrust = thrust_vec_body / self.mass  
+        thrust_vec_body[:, 2] = a_thrust_z
+        a_thrust = thrust_vec_body  # 已经是加速度 m/s²，不需再除以 mass
         
         # 2. 计算重力 (机体系下)
         g_world_batch = self.gravity_vec.view(1, 3, 1).expand(batch_size, -1, -1)
@@ -238,7 +239,7 @@ def train_pipeline():
     
     # --- 4. 初始化模型 ---
     model = PI_WAN(input_dim=Config.INPUT_DIM, output_dim=Config.OUTPUT_DIM).to(device)
-    dynamics = QuadrotorDynamics(mass=Config.MASS, gravity=Config.GRAVITY, dt=Config.DT, max_thrust=Config.MAX_THRUST).to(device)
+    dynamics = QuadrotorDynamics(mass=Config.MASS, gravity=Config.GRAVITY, dt=Config.DT, thrust_ceiling=Config.THRUST_CEILING).to(device)
     
     # 【修改 1】: 加入 weight_decay=1e-4 进行 L2 正则化，预防过拟合
     #这个会导致收敛效果差很多，不要用
