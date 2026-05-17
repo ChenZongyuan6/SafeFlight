@@ -19,6 +19,36 @@ class CausalConv1d(nn.Module):
             x = x[:, :, :-self.padding]
         return x
 
+# [旧版 PI_WAN，不含归一化层，供加载旧版模型时使用（需配合外部手动归一化）]
+# class PI_WAN(nn.Module):
+#     def __init__(self, input_dim=19, output_dim=3, hidden_dim=64):
+#         super().__init__()
+#         self.net = nn.Sequential(
+#             CausalConv1d(input_dim, hidden_dim, kernel_size=3, dilation=1),
+#             nn.ReLU(), nn.BatchNorm1d(hidden_dim),
+#             CausalConv1d(hidden_dim, hidden_dim, kernel_size=3, dilation=2),
+#             nn.ReLU(), nn.BatchNorm1d(hidden_dim),
+#             CausalConv1d(hidden_dim, hidden_dim, kernel_size=3, dilation=4),
+#             nn.ReLU(), nn.BatchNorm1d(hidden_dim),
+#             CausalConv1d(hidden_dim, hidden_dim, kernel_size=3, dilation=8),
+#             nn.ReLU(), nn.BatchNorm1d(hidden_dim),
+#         )
+#         self.head = nn.Sequential(
+#             nn.Linear(hidden_dim, hidden_dim),
+#             nn.ReLU(),
+#             nn.Linear(hidden_dim, output_dim)
+#         )
+#
+#     def forward(self, x):
+#         x = x.permute(0, 2, 1)
+#         feat = self.net(x)
+#         feat_last = feat[:, :, -1]
+#         out = self.head(feat_last)
+#         return out
+
+# [新版 PI_WAN，内置归一化层，mean/std 随模型权重一起保存/加载]
+# 必须与 train_pinn_0317.py 中的新版 PI_WAN 保持一致
+import torch
 class PI_WAN(nn.Module):
     def __init__(self, input_dim=19, output_dim=3, hidden_dim=64):
         super().__init__()
@@ -37,8 +67,18 @@ class PI_WAN(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim, output_dim) 
         )
+        self.register_buffer('input_mean', torch.zeros(input_dim))
+        self.register_buffer('input_std',  torch.ones(input_dim))
+        self._normalize = False
+
+    def set_normalization(self, mean, std):
+        self.input_mean.copy_(mean.cpu())
+        self.input_std.copy_(std.cpu())
+        self._normalize = True
 
     def forward(self, x):
+        if self._normalize:
+            x = (x - self.input_mean) / self.input_std
         x = x.permute(0, 2, 1)
         feat = self.net(x)
         feat_last = feat[:, :, -1] 
@@ -65,13 +105,16 @@ def evaluate_and_plot():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Loading model onto {device}...")
 
-    # --- 1. 获取归一化参数（与训练时保持一致）---
-    train_data = torch.load(train_data_path)["inputs"].float()
-    split_idx  = int(train_data.shape[0] * 0.9)
-    flat_train = train_data[:split_idx].reshape(-1, train_data.shape[-1])
-    mean = flat_train.mean(dim=0).to(device)
-    std  = flat_train.std(dim=0).to(device) + 1e-6
-    print("Normalization stats loaded.")
+    # --- 1. 获取归一化参数 ---
+    # [旧版：从外部训练集重新计算 mean/std，必须和训练时用的数据集一致，否则推理偏差大]
+    # train_data = torch.load(train_data_path)["inputs"].float()
+    # split_idx  = int(train_data.shape[0] * 0.9)
+    # flat_train = train_data[:split_idx].reshape(-1, train_data.shape[-1])
+    # mean = flat_train.mean(dim=0).to(device)
+    # std  = flat_train.std(dim=0).to(device) + 1e-6
+    # print("Normalization stats loaded.")
+    # [新版：mean/std 已内置于模型权重中，加载模型后自动生效，无需外部计算]
+    print("Normalization stats will be loaded from model weights.")
 
     # --- 2. 加载测试集 ---
     test_dataset = torch.load(test_data_path)
@@ -81,6 +124,8 @@ def evaluate_and_plot():
     # --- 3. 加载模型 ---
     model = PI_WAN(input_dim=19, output_dim=3).to(device)
     model.load_state_dict(torch.load(model_path, map_location=device))
+    # [新版：加载权重后，mean/std 已恢复，开启内置归一化]
+    model._normalize = True
     model.eval()
 
     # --- 动态保存目录与时间戳 ---
@@ -97,14 +142,17 @@ def evaluate_and_plot():
         traj_labels = test_labels[env_idx]   # [Time, 3]
         total_steps = traj_inputs.shape[0]
 
-        traj_inputs_norm = (traj_inputs - mean) / std
+        # [旧版：推理前手动归一化输入]
+        # traj_inputs_norm = (traj_inputs - mean) / std
+        # [新版：模型内部自动归一化，直接传原始值]
 
         preds, gts = [], []
         print(f"[Env {env_idx}] Inferring {total_steps} steps ...")
         with torch.no_grad():
             for t in range(window_size, total_steps):
-                x_win  = traj_inputs_norm[t - window_size : t, :].unsqueeze(0)  # [1, W, 19]
-                d_pred = model(x_win).squeeze(0)                                 # [3]
+                # [旧版] x_win = traj_inputs_norm[t - window_size : t, :].unsqueeze(0)
+                x_win  = traj_inputs[t - window_size : t, :].unsqueeze(0)  # [1, W, 19] 原始值，模型内部归一化
+                d_pred = model(x_win).squeeze(0)                            # [3]
                 d_gt   = traj_labels[t - 1, :]                                   # [3]
                 preds.append(d_pred.cpu().numpy())
                 gts.append(d_gt.cpu().numpy())
